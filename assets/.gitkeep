@@ -1,0 +1,3 @@
+This folder holds the beep WAV file that hardware/audio.py generates on the
+Raspberry Pi the first time you run main.py. The generated beep.wav itself is
+gitignored, because it is rebuilt automatically from config.py settings.

@@ -1,0 +1,36 @@
+# ==========================================================================
+# Python dependencies for the Phase 1 hardware test
+# ==========================================================================
+#
+# READ THIS BEFORE RUNNING pip.
+#
+# On Raspberry Pi OS, the libraries this project needs are NOT supposed to be
+# installed with pip. Picamera2, OpenCV, lgpio and pygame all ship as tested
+# apt packages that are built against the system libcamera, SDL and kernel
+# headers. Installing them from pip instead is slow (it compiles from source
+# on a Pi 3), often fails, and can end up with a Picamera2 that cannot see
+# libcamera at all.
+#
+# So the supported install on the Raspberry Pi is apt:
+#
+#     sudo apt update
+#     sudo apt install -y python3-picamera2 python3-opencv python3-lgpio \
+#                         python3-pygame alsa-utils
+#
+# That is the whole dependency list. This file is deliberately almost empty,
+# and that is the correct outcome - see README.md for the full explanation.
+#
+# --------------------------------------------------------------------------
+# Standard library only (nothing to install): argparse, array, collections,
+# math, os, platform, subprocess, sys, threading, time, wave, pathlib
+# --------------------------------------------------------------------------
+#
+# The entries below are listed for completeness / for non-Raspberry-Pi-OS
+# systems. They are COMMENTED OUT on purpose. Do not uncomment them on
+# Raspberry Pi OS unless apt genuinely has no package for you.
+#
+# numpy>=1.24          # pulled in automatically by python3-opencv / picamera2
+# opencv-python>=4.6   # use apt's python3-opencv on Raspberry Pi OS instead
+# pygame>=2.1          # use apt's python3-pygame on Raspberry Pi OS instead
+#
+# picamera2 and lgpio are intentionally absent: install them with apt only.
