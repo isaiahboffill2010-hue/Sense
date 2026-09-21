@@ -113,6 +113,14 @@ def api_key_is_present(environ=None):
     return bool(environ.get(config.GEMINI_API_KEY_ENV, "").strip())
 
 
+def _redact(text, secret):
+    """Strip a secret out of text before it is ever printed or stored."""
+    rendered = str(text)
+    if secret:
+        rendered = rendered.replace(secret, "<redacted>")
+    return rendered
+
+
 # ==========================================================================
 # The worker
 # ==========================================================================
@@ -182,28 +190,97 @@ class GeminiWorker(threading.Thread):
 
     @staticmethod
     def _make_client(genai):
-        """Build the client, with an SDK-level timeout if this build takes one.
+        """Build a Gemini DEVELOPER API client with explicit credentials.
 
-        The timeout argument has moved around between SDK releases, so a
-        rejected argument must not stop us starting - the worker's own
-        wall-clock deadline is the guarantee that actually matters.
+        Everything that decides how we authenticate is passed explicitly
+        here. Nothing is left to the SDK's environment auto-detection.
+
+        That matters because an earlier version of this function called a
+        bare genai.Client(), and the very first real request came back as
+
+            401 UNAUTHENTICATED / ACCESS_TOKEN_TYPE_UNSUPPORTED
+            "Request is missing required authentication credentials."
+
+        which is Google's generic "no usable credential arrived in the
+        expected header" response. Our key was loaded and present in the
+        environment, so somewhere between os.environ and the wire the SDK
+        did not attach it as an API key. Passing it directly removes the
+        guesswork: there is now exactly one place the credential can come
+        from, and it is the key our own .env.local loader read.
+
+        We also pin the backend off Vertex / Enterprise. Those backends
+        authenticate with OAuth and reject API keys outright, and the flag
+        that selects them has been renamed across SDK releases - so we pass
+        whichever name this installed build actually accepts.
         """
-        timeout_ms = int(config.GEMINI_REQUEST_TIMEOUT_S * 1000)
+        import inspect
+
+        # Read OUR key. Deliberately not GOOGLE_API_KEY, which the SDK would
+        # otherwise silently prefer over GEMINI_API_KEY.
+        api_key = os.environ.get(config.GEMINI_API_KEY_ENV, "").strip()
+        if not api_key:
+            raise VisionError(
+                "{} is empty at client construction time.".format(
+                    config.GEMINI_API_KEY_ENV
+                )
+            )
+
+        # Only pass arguments this build of the SDK actually accepts.
         try:
-            from google.genai import types
-
-            client = genai.Client(
-                http_options=types.HttpOptions(timeout=timeout_ms)
+            parameters = inspect.signature(genai.Client).parameters
+            takes_anything = any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
             )
-            note = "SDK timeout {} ms".format(timeout_ms)
-        except Exception:
-            # No http_options on this build: fall back to a plain client.
-            client = genai.Client()
-            note = "no SDK timeout, {:.0f}s worker deadline only".format(
-                config.GEMINI_DEADLINE_S
-            )
+        except (TypeError, ValueError):
+            parameters, takes_anything = {}, False
 
-        return client, "{} ({})".format(config.GEMINI_MODEL, note)
+        def accepted(name):
+            return takes_anything or name in parameters
+
+        kwargs = {"api_key": api_key}
+
+        pinned = []
+        for flag in ("vertexai", "enterprise"):
+            if accepted(flag):
+                kwargs[flag] = False
+                pinned.append(flag)
+
+        timeout_ms = int(config.GEMINI_REQUEST_TIMEOUT_S * 1000)
+        timeout_note = "no SDK timeout, {:.0f}s worker deadline only".format(
+            config.GEMINI_DEADLINE_S
+        )
+        if accepted("http_options"):
+            try:
+                from google.genai import types
+
+                kwargs["http_options"] = types.HttpOptions(timeout=timeout_ms)
+                timeout_note = "SDK timeout {} ms".format(timeout_ms)
+            except Exception:
+                kwargs.pop("http_options", None)
+
+        try:
+            client = genai.Client(**kwargs)
+        except Exception as exc:
+            # Never let a secret escape in an exception message.
+            raise VisionError(
+                "could not build the Gemini client: {}: {}".format(
+                    type(exc).__name__, _redact(exc, api_key)
+                )
+            ) from None
+
+        # Report what we actually got, not what we hoped for. If a future
+        # SDK ignores the pin, this says so instead of quietly claiming
+        # "Developer API" while talking to an OAuth endpoint.
+        if getattr(client, "vertexai", False) or getattr(client, "enterprise", False):
+            backend = "WARNING: resolved to Vertex/Enterprise, not Developer API"
+        else:
+            backend = "Developer API"
+
+        detail = ", ".join([backend, timeout_note])
+        if pinned:
+            detail += ", pinned via {}=False".format("/".join(pinned))
+
+        return client, "{} ({})".format(config.GEMINI_MODEL, detail)
 
     # ---------------------------------------------------------- requests
     def request(self, frame, distance_cm):

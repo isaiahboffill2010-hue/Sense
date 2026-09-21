@@ -19,6 +19,7 @@ No network access happens here either - the Gemini tests exercise the queue,
 the staleness rules and the failure handling with the API call stubbed out.
 """
 
+import os
 import sys
 import threading
 import time
@@ -430,6 +431,83 @@ check("api_key_is_present is False for whitespace",
       vision.api_key_is_present(environ={"GEMINI_API_KEY": "   "}), False)
 check("api_key_is_present is True when set",
       vision.api_key_is_present(environ={"GEMINI_API_KEY": "k"}), True)
+
+
+# ==========================================================================
+print("\nGemini client is built for the Developer API, explicitly")
+# ==========================================================================
+# Verified with a stub SDK so this runs anywhere and makes no network call.
+# What matters is WHICH arguments reach genai.Client.
+
+
+class StubClient:
+    """Records exactly what GeminiWorker._make_client passed us."""
+
+    last = None
+
+    def __init__(self, api_key=None, vertexai=None, enterprise=None,
+                 http_options=None):
+        self.api_key = api_key
+        self.vertexai = vertexai
+        self.enterprise = enterprise
+        self.http_options = http_options
+        StubClient.last = self
+
+
+class StubGenai:
+    Client = StubClient
+
+
+FAKE_KEY = "test-key-do-not-use-1234567890"
+_saved_key = os.environ.get("GEMINI_API_KEY")
+os.environ["GEMINI_API_KEY"] = FAKE_KEY
+try:
+    client, description = vision.GeminiWorker._make_client(StubGenai)
+
+    check("the API key is passed explicitly", client.api_key, FAKE_KEY)
+    check("vertexai is explicitly disabled", client.vertexai, False)
+    check("enterprise is explicitly disabled", client.enterprise, False)
+    check("the startup line names the Developer API",
+          "Developer API" in description, True)
+    check("the startup line names the model",
+          config.GEMINI_MODEL in description, True)
+    check("the startup line NEVER contains the key",
+          FAKE_KEY in description, False)
+
+    # An empty key must fail loudly rather than fall through to no-credential.
+    os.environ["GEMINI_API_KEY"] = "   "
+    raised = None
+    try:
+        vision.GeminiWorker._make_client(StubGenai)
+    except vision.VisionError as exc:
+        raised = exc
+    check("an empty key raises VisionError", raised is not None, True)
+    check("and that error does not leak anything",
+          FAKE_KEY in str(raised or ""), False)
+
+    # If a future SDK ignores the pin, say so instead of claiming otherwise.
+    class VertexIgnoringClient(StubClient):
+        def __init__(self, **kwargs):
+            StubClient.__init__(self, **kwargs)
+            self.vertexai = True          # pretend the pin was ignored
+
+    class StubGenaiVertex:
+        Client = VertexIgnoringClient
+
+    os.environ["GEMINI_API_KEY"] = FAKE_KEY
+    _, vertex_description = vision.GeminiWorker._make_client(StubGenaiVertex)
+    check("a backend that resolves to Vertex is reported, not hidden",
+          "WARNING" in vertex_description, True)
+finally:
+    if _saved_key is None:
+        os.environ.pop("GEMINI_API_KEY", None)
+    else:
+        os.environ["GEMINI_API_KEY"] = _saved_key
+
+check("secrets are redacted from error text",
+      vision._redact("boom sk-abc123 boom", "sk-abc123"), "boom <redacted> boom")
+check("redaction copes with no secret",
+      vision._redact("plain message", ""), "plain message")
 
 
 # ==========================================================================
