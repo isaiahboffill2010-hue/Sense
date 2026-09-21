@@ -80,7 +80,8 @@ SEVERITY = {UNKNOWN: -1, SAFE: 0, CAUTION: 1, WARNING: 2, DANGER: 3}
 
 # What AlertPolicy.update() hands back to the main loop.
 AlertDecision = collections.namedtuple(
-    "AlertDecision", ["status", "repeat_interval", "play_warning_tone"]
+    "AlertDecision",
+    ["status", "repeat_interval", "play_warning_tone", "request_ai"],
 )
 
 
@@ -127,6 +128,7 @@ class AlertPolicy:
     def __init__(self, now=None):
         self._status = UNKNOWN
         self._last_warning_tone_at = None
+        self._last_ai_request_at = None
         # Injectable clock so tests do not have to sleep in real time.
         self._now = now or time.monotonic
 
@@ -148,10 +150,15 @@ class AlertPolicy:
         if play_tone:
             self._last_warning_tone_at = self._now()
 
+        request_ai = self._should_request_ai(status, previous)
+        if request_ai:
+            self._last_ai_request_at = self._now()
+
         return AlertDecision(
             status=status,
             repeat_interval=beep_interval_for(status),
             play_warning_tone=play_tone,
+            request_ai=request_ai,
         )
 
     def _warning_tone_is_armed(self):
@@ -166,3 +173,44 @@ class AlertPolicy:
         if gap <= 0 or self._last_warning_tone_at is None:
             return True
         return (self._now() - self._last_warning_tone_at) >= gap
+
+    # ---------------------------------------------------------- AI trigger
+    def _should_request_ai(self, status, previous):
+        """True when a fresh Gemini look is warranted.
+
+        The rule is "an obstacle just moved into a CLOSER band": any step up
+        in severity into CAUTION, WARNING or DANGER asks for one analysis.
+
+        Driving it off severity rather than naming one band matters, because
+        readings arrive roughly every 90 ms and a walking pace covers about
+        13 cm in that time - so a fast approach, or simply turning your head,
+        can jump SAFE -> WARNING or SAFE -> DANGER and skip a band entirely.
+        Keying on any increase means those cases still get analysed.
+
+        In the ordinary SAFE -> CAUTION -> WARNING -> DANGER walk-up, only
+        the CAUTION entry actually reaches the API: the later steps follow
+        within a second or two and the global cooldown absorbs them. That is
+        the intended behaviour - CAUTION is where the camera framing is best
+        and where there is the most time for a reply to come back.
+
+        Moving AWAY never asks: backing out of DANGER into WARNING is a
+        decrease in severity, so it returns False.
+        """
+        if status not in (CAUTION, WARNING, DANGER):
+            return False
+        if SEVERITY[status] <= SEVERITY[previous]:
+            return False
+        return self._ai_is_armed()
+
+    def _ai_is_armed(self):
+        """False while the global Gemini cooldown is still running.
+
+        Deliberately independent of the warning-tone re-arm timer: that one
+        exists to avoid annoying the user, this one exists to bound API
+        usage. They are allowed to disagree, and when they do the local tone
+        always wins - a tone with no description is fine, the reverse is not.
+        """
+        gap = config.GEMINI_COOLDOWN_S
+        if gap <= 0 or self._last_ai_request_at is None:
+            return True
+        return (self._now() - self._last_ai_request_at) >= gap

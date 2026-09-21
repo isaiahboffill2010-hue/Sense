@@ -1,10 +1,10 @@
-# Navigation Headband — Phase 1 Hardware Test
+# Sense — Navigation Headband
 
 A prototype wearable navigation aid for blind and low-vision users.
 
-**This repository currently contains Phase 1 only: a hardware diagnostic program.**
-There is no AI, no Gemini, no object recognition and no speech in here yet. The
-only job of this code is to prove that the Raspberry Pi hardware works.
+**Phase 1 (hardware) and Phase 2 (Gemini vision) are implemented.**
+There is no speech output yet — Gemini's descriptions appear in the terminal
+and on the preview HUD. Text-to-speech comes in a later phase.
 
 ---
 
@@ -19,6 +19,8 @@ at the same time:
 3. Draws the current distance and a status word on top of the video.
 4. Plays **alerts through your headphones** — one subtle tone when an
    obstacle gets close, repeated beeps only when it gets dangerously close.
+5. Asks **Gemini** for a very short description of what is ahead, once per
+   approach, and shows it as `AI: Person ahead.`
 
 The on-screen overlay looks like this:
 
@@ -30,9 +32,11 @@ The on-screen overlay looks like this:
 |                                       |
 | Distance: 72 cm                       |
 | Status: CAUTION                       |
+| AI: Person ahead.                     |
 | Camera: OK                            |
 | Ultrasonic: OK                        |
 | Audio: OK                             |
+| Gemini: OK                            |
 | Press Q to quit                       |
 -----------------------------------------
 ```
@@ -42,13 +46,13 @@ The on-screen overlay looks like this:
 The device stays **mostly silent during normal use**. It only makes a sound
 when it has something new to tell you.
 
-| Distance | Status | Sound |
-| --- | --- | --- |
-| more than 100 cm | `SAFE` | silent, still measuring |
-| 50 – 100 cm | `CAUTION` | silent, obstacle tracked |
-| 25 – 50 cm | `WARNING` | **one** subtle 660 Hz tone on entering the band, then quiet |
-| under 25 cm | `DANGER` | repeated 1000 Hz beeps while it lasts |
-| no valid reading | `UNKNOWN` | silent |
+| Distance | Status | Sound | Gemini |
+| --- | --- | --- | --- |
+| more than 100 cm | `SAFE` | silent, still measuring | no |
+| 50 – 100 cm | `CAUTION` | silent, obstacle tracked | **yes** — one analysis |
+| 25 – 50 cm | `WARNING` | **one** subtle 660 Hz tone on entry, then quiet | only if the cooldown allows |
+| under 25 cm | `DANGER` | repeated 1000 Hz beeps while it lasts | only if the cooldown allows |
+| no valid reading | `UNKNOWN` | silent | no |
 
 So a family member standing in front of you at 30–40 cm produces **one tone,
 not a stream of them**. The tone plays again only if the obstacle leaves the
@@ -76,7 +80,7 @@ prevent that, both in [config.py](config.py):
 says so — it never guesses a distance and never fakes a "safe" reading.
 
 This logic is covered by [test_alerts.py](test_alerts.py), which needs no
-hardware:
+hardware and makes no network calls:
 
 ```bash
 python3 test_alerts.py
@@ -84,11 +88,75 @@ python3 test_alerts.py
 
 ---
 
+## Gemini vision (Phase 2)
+
+When an obstacle moves into a **closer** band, the main loop hands a copy of
+the camera frame it already has to a background thread, which asks Gemini for
+one short navigation phrase.
+
+```
+AI: Person ahead.
+AI: Two people ahead.
+AI: Chair directly ahead.
+AI: Closed door ahead.
+AI: Stairs descending ahead.
+AI: Path clear.
+```
+
+**Gemini is strictly optional.** No internet, a timeout, an API error, a quota
+limit, a malformed reply — none of it can delay or suppress the ultrasonic
+readings or the local beeps. If Gemini is unavailable the device behaves
+exactly as it did in Phase 1 and simply shows no description.
+
+### When it asks
+
+One analysis per approach, triggered when an obstacle steps **up** in severity
+into `CAUTION`, `WARNING` or `DANGER`, and rate-limited by a single global
+`GEMINI_COOLDOWN_S = 5.0` cooldown.
+
+In an ordinary walk-up (`SAFE → CAUTION → WARNING → DANGER`) only the
+**CAUTION** entry actually reaches the API — the later steps follow within a
+second or two and the cooldown absorbs them. CAUTION is deliberately where it
+fires: at 50–100 cm the camera framing is far better than at 25 cm, where a
+person simply fills the frame, and there is more time for the reply to arrive.
+
+Keying on *any* increase in severity rather than one named band matters,
+because readings arrive every ~90 ms and walking pace covers ~13 cm in that
+time. A fast approach — or just turning your head — can jump straight from
+`SAFE` to `WARNING` or `DANGER`, skipping a band. Those cases still get
+analysed.
+
+Moving **away** never triggers a request.
+
+### Stale descriptions are discarded
+
+Age is measured from the moment the **image was captured**, not from when the
+reply arrived. A description older than `GEMINI_RESULT_MAX_AGE_S = 4.0`
+seconds is thrown away instead of shown, so `Chair ahead.` can never appear
+eight seconds after you have already walked past the chair. This applies both
+when a reply arrives late and while a description is sitting on screen.
+
+### Nothing stacks up
+
+The request queue holds exactly **one** item. If an analysis is already queued
+or in flight, a new request is dropped rather than added. JPEG encoding and
+the network call both happen on the worker thread, never on the camera/UI
+thread.
+
+### Cost
+
+A 640×480 frame fits in a single 768×768 tile = 258 image tokens. With the
+prompt and a short reply that is roughly **$0.0001 per call** on
+`gemini-3.5-flash-lite`. Even saturating the 5 s cooldown for a solid hour is
+about 8 cents. There is also a free tier.
+
+---
+
 ## Hardware used
 
 | Part | Notes |
 | --- | --- |
-| Raspberry Pi 3 | running Raspberry Pi OS |
+| Raspberry Pi 3 | running Raspberry Pi OS, Wi-Fi for Gemini (optional) |
 | SunFounder Robot HAT+5 | mounted on the Pi's 40-pin header |
 | SunFounder ultrasonic sensor | HC-SR04-style head with SunFounder's interface board, into the HAT's digital ports |
 | Raspberry Pi CSI camera | connected with the ribbon cable |
@@ -206,9 +274,27 @@ sudo reboot
 
 ### 3. Python packages (`pip`)
 
-**None.** See [requirements.txt](requirements.txt) — it is intentionally all
-comments, and that is the correct outcome. Everything else this project uses
-comes from the standard library.
+Exactly one: **`google-genai`**, for Gemini. It is pure Python, there is no
+apt package for it, and the old `google-generativeai` SDK is deprecated.
+
+Raspberry Pi OS Bookworm and newer block system-wide pip installs (PEP 668).
+**Do not solve that with a plain virtual environment** — a plain venv cannot
+see the apt-installed Picamera2 or the system-installed `robot_hat`, which
+would break Phase 1. Use either:
+
+```bash
+# (a) user install - leaves the working Phase 1 environment untouched
+pip3 install --user --break-system-packages google-genai
+```
+
+```bash
+# (b) or a venv that can still see the system packages
+python3 -m venv --system-site-packages ~/sense-venv
+~/sense-venv/bin/pip install google-genai
+~/sense-venv/bin/python main.py
+```
+
+Everything else this project uses comes from apt or the standard library.
 
 > **If you use a virtual environment**, create it with
 > `python3 -m venv --system-site-packages .venv` so it can still see the
@@ -319,7 +405,16 @@ sudo reboot
 cd ~
 git clone https://github.com/isaiahboffill2010-hue/Sense.git
 cd Sense
+
+# 5. Gemini SDK
+pip3 install --user --break-system-packages google-genai
+
+# 6. Gemini API key - create .env.local (already gitignored)
+echo 'GEMINI_API_KEY=your-key-here' > .env.local
 ```
+
+Get a key from <https://aistudio.google.com/apikey>. The key is read from the
+environment, never hardcoded, never printed, and never committed.
 
 Already cloned it before? Just `cd ~/Sense && git pull`.
 
@@ -333,6 +428,15 @@ ports, there is nothing to edit.
 
 Run it **from the Pi's desktop**, or over VNC, or from a terminal on a screen
 attached to the Pi — the live preview needs a display:
+
+Check Gemini first — this makes one API call (~$0.0001) and exercises the
+exact code path the app uses, so if it passes, the app's Gemini path works:
+
+```bash
+python3 smoke_test_gemini.py
+```
+
+Then:
 
 ```bash
 python3 main.py
@@ -357,6 +461,9 @@ Audio: checking...
 Audio: OK - pygame.mixer / SDL (pulseaudio)
        beep file: /home/pi/Sense/assets/beep.wav
        a test beep was sent to the headphones - did you hear it?
+Gemini vision: checking...
+       loaded from .env.local: GEMINI_API_KEY
+Gemini vision: OK - gemini-3.5-flash-lite (SDK timeout 8000 ms)
 --------------------------------------------------------------
 ```
 
@@ -369,6 +476,7 @@ Audio: OK - pygame.mixer / SDL (pulseaudio)
 | `python3 main.py --skip-camera` | test only the sensor and the beeps |
 | `python3 main.py --skip-ultrasonic` | test only the camera and the beeps |
 | `python3 main.py --skip-audio` | test silently |
+| `python3 main.py --skip-gemini` | run Phase 1 only, no API calls |
 | `python3 main.py --help` | list all options |
 
 ---
@@ -449,6 +557,31 @@ sudo apt install -y python3-picamera2
 python3 -c "from picamera2 import Picamera2; print('ok')"
 ```
 
+### `Gemini: NOT CONFIGURED`
+
+`GEMINI_API_KEY` is not set. Put it in `.env.local` (already gitignored) or
+export it, then re-run `python3 smoke_test_gemini.py`.
+
+### `GEMINI ERROR: The google-genai package is not installed`
+
+```bash
+pip3 install --user --break-system-packages google-genai
+python3 -c "import google.genai; print('ok')"
+```
+
+### Gemini descriptions never appear
+
+Run `python3 smoke_test_gemini.py` first. If that passes but the HUD stays
+blank, the replies are probably arriving too late and being discarded as
+stale — the smoke test prints the round-trip time. Raise
+`GEMINI_RESULT_MAX_AGE_S` in [config.py](config.py) if your connection is
+consistently slow.
+
+### Gemini keeps erroring but the beeps still work
+
+That is the intended behaviour — Gemini is an optional layer. Use
+`python3 main.py --skip-gemini` to silence it entirely.
+
 ### `AUDIO ERROR: Headphone/audio output unavailable`
 
 ```bash
@@ -497,9 +630,12 @@ hardware/
     ultrasonic.py       SunFounder sensor via robot_hat + background reader thread
     audio.py            beep generation + playback + the beeper thread
 
+vision.py               Gemini worker thread, .env loader, staleness rules
+
 assets/                 beep.wav and warning_tone.wav generated on first run
-test_alerts.py          hardware-free tests for the alert behaviour
-requirements.txt        explains why pip is not used here
+test_alerts.py          hardware-free tests for alerts + the Gemini logic
+smoke_test_gemini.py    one-shot "can this Pi reach Gemini?" check
+requirements.txt        the one pip dependency, and why everything else is apt
 ```
 
 ### How it stays smooth
@@ -511,6 +647,7 @@ Three threads, so nothing blocks the video:
 | main thread | capture frames, draw the overlay, `cv2.imshow`, handle keys |
 | `ultrasonic` | fire pings through `robot_hat`, publish the latest reading |
 | `beeper` | sleep between danger beeps, and play one-shot warning tones |
+| `gemini` | JPEG-encode a frame copy and call the API |
 
 The main loop never calls `time.sleep()` for the beep rhythm and never waits
 for an echo. It just reads the latest sensor snapshot and tells the beeper
@@ -538,7 +675,7 @@ never look like a very close obstacle.
 
 ## Roadmap — not built yet
 
-Later phases will add the Gemini API, AI image understanding, spoken
-descriptions of the surroundings, richer obstacle warnings and possibly GPS
-navigation. **None of that is in this repository yet.** Phase 1 is only
-camera + ultrasonic + headphone beeps + live preview.
+Later phases will add spoken output (text-to-speech) for the Gemini
+descriptions, richer obstacle warnings, and possibly GPS navigation.
+**None of that is in this repository yet.** Gemini's descriptions currently
+appear only in the terminal and on the HUD.

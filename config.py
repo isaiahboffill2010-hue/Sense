@@ -222,3 +222,76 @@ PLAY_STARTUP_TEST_BEEP = True
 #     AUDIO_DEVICE = "plughw:CARD=Headphones,DEV=0"
 
 AUDIO_DEVICE = None
+
+
+# ==========================================================================
+# 6. GEMINI VISION  (Phase 2)
+# ==========================================================================
+# Gemini is strictly an ENHANCEMENT layer. The ultrasonic sensor and the
+# local beeps are the safety system and never wait on it. If the network is
+# down, the API errors, or a reply takes too long, the device keeps behaving
+# exactly like Phase 1 and simply shows no description.
+
+GEMINI_ENABLED = True
+
+# Cheapest current model that does image UNDERSTANDING (image in, text out).
+# Note: models with an "-image" suffix are image GENERATORS - not this.
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+# --- API key -------------------------------------------------------------
+# The key is read from the environment. vision.py also loads .env.local into
+# the environment at startup so you do not have to export it by hand.
+# The key is never hardcoded, never printed and never committed
+# (.gitignore already covers .env and .env.*).
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+ENV_FILE_PATH = PROJECT_ROOT / ".env.local"
+
+# --- When to ask -----------------------------------------------------------
+# One analysis is requested when an obstacle moves into a CLOSER band
+# (CAUTION, WARNING or DANGER). Standing still in a band asks nothing more.
+# This single global cooldown is what stops repeated requests; it is
+# deliberately SEPARATE from WARNING_TONE_MIN_GAP_S, which only governs the
+# local tone.
+GEMINI_COOLDOWN_S = 5.0
+
+# --- Staleness -------------------------------------------------------------
+# Age is measured from the moment the IMAGE WAS CAPTURED, not from when the
+# reply arrived. A description older than this is discarded rather than
+# shown, so "Chair ahead." can never appear after the user has walked past
+# the chair.
+GEMINI_RESULT_MAX_AGE_S = 4.0
+
+# --- Timeouts --------------------------------------------------------------
+# Two layers. The SDK timeout asks the HTTP client to give up, and the worker
+# deadline is the wall-clock backstop that discards a reply arriving after a
+# hung socket finally returns. The deadline is the real guarantee.
+GEMINI_REQUEST_TIMEOUT_S = 8.0
+GEMINI_DEADLINE_S = 10.0
+
+# --- Image ---------------------------------------------------------------
+# 640x480 fits inside a single 768x768 tile, which costs 258 image tokens,
+# so there is nothing to gain from downscaling further.
+GEMINI_JPEG_QUALITY = 80
+
+# --- Output ----------------------------------------------------------------
+GEMINI_MAX_DESCRIPTION_CHARS = 60
+
+# Do not reprint the same error more often than this (seconds). Keeps a
+# flapping network from filling the terminal.
+GEMINI_ERROR_REPEAT_S = 30.0
+
+# The prompt. {distance_cm} is filled in with the measured distance.
+GEMINI_PROMPT = (
+    "You are the vision system of a navigation aid for a blind user. "
+    "An obstacle was detected about {distance_cm} cm ahead.\n\n"
+    "Reply with ONE short phrase of at most six words naming the most "
+    "important navigation obstacle or hazard directly ahead.\n\n"
+    "Prioritise: people, chairs, tables, walls, doors, stairs, curbs, "
+    "poles, vehicles, pathways, and immediate trip or collision hazards.\n\n"
+    "Do not identify who anyone is. Do not describe appearance, clothing, "
+    "age, gender, race or any other personal characteristic. Do not add "
+    "commentary, explanation or punctuation beyond a final full stop.\n\n"
+    'Examples: "Person ahead." "Two people ahead." "Chair directly ahead." '
+    '"Closed door ahead." "Stairs descending ahead." "Wall ahead."\n\n'
+    'If there is no meaningful navigation obstacle, reply exactly: "Path clear."'
+)

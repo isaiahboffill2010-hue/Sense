@@ -10,10 +10,13 @@ anywhere, including a Windows development PC:
 
     python3 test_alerts.py
 
-It covers the two things that are hard to check by waving your hand at the
-sensor: that a person standing still produces exactly one tone, and that
-jitter around the 25 cm and 50 cm boundaries does not produce a stream of
-them.
+It covers the things that are hard to check by waving your hand at the
+sensor: that a person standing still produces exactly one tone, that jitter
+around the 25 cm and 50 cm boundaries does not produce a stream of them, and
+that the Gemini trigger fires once per approach rather than continuously.
+
+No network access happens here either - the Gemini tests exercise the queue,
+the staleness rules and the failure handling with the API call stubbed out.
 """
 
 import sys
@@ -22,6 +25,7 @@ import time
 
 import alerts
 import config
+import vision
 from hardware.audio import TONE_DANGER, TONE_WARNING, BeepController
 
 FAILURES = []
@@ -47,6 +51,19 @@ class FakeClock:
 
     def advance(self, seconds):
         self.now += seconds
+
+
+def trace(distances, clock=None, policy=None):
+    """Feed distances to a policy and return the list of AlertDecisions."""
+    policy = policy or alerts.AlertPolicy(now=clock or FakeClock())
+    return [policy.update(d) for d in distances]
+
+
+def ai_calls(distances, clock=None):
+    """Distances at which an AI request would have been made."""
+    clock = clock or FakeClock()
+    policy = alerts.AlertPolicy(now=clock)
+    return [d for d in distances if policy.update(d).request_ai]
 
 
 def run(distances, clock=None):
@@ -213,6 +230,207 @@ finally:
 
 check("stop() returns promptly (Q / Ctrl+C stay responsive)", stop_took < 1.0, True)
 check("beeper thread actually exited", beeper.is_alive(), False)
+
+# ==========================================================================
+print("\nGemini trigger: the transitions you asked about")
+# ==========================================================================
+check("SAFE -> CAUTION requests AI", ai_calls([150, 80]), [80])
+check("SAFE -> DANGER requests AI (fast-approach gap closed)",
+      ai_calls([150, 20]), [20])
+check("SAFE -> WARNING requests AI (head-turn gap closed)",
+      ai_calls([150, 40]), [40])
+
+# Normal walk-up: CAUTION fires, the later bands are absorbed by the cooldown
+# because they follow within a second or two.
+check("CAUTION -> WARNING does not duplicate the request",
+      ai_calls([150, 80, 40]), [80])
+check("CAUTION -> DANGER respects the cooldown",
+      ai_calls([150, 80, 20]), [80])
+check("WARNING -> DANGER respects the cooldown",
+      ai_calls([150, 40, 20]), [40])
+
+check("standing still in CAUTION never re-requests",
+      ai_calls([150, 80, 80, 75, 82, 78, 85, 79, 81]), [80])
+check("boundary noise around 50 cm does not spam Gemini",
+      ai_calls([150, 80, 52, 48, 53, 47, 51, 49, 54, 46]), [80])
+
+check("moving AWAY never requests (DANGER -> WARNING -> CAUTION)",
+      ai_calls([150, 20, 35, 70]), [20])
+check("no reading never requests", ai_calls([None, None]), [])
+check("staying in SAFE never requests", ai_calls([200, 150, 300]), [])
+
+# ==========================================================================
+print("\nGemini cooldown is independent of the warning-tone re-arm")
+# ==========================================================================
+clock = FakeClock()
+policy = alerts.AlertPolicy(now=clock)
+policy.update(150)
+check("first CAUTION entry requests", policy.update(80).request_ai, True)
+clock.advance(1.0)
+policy.update(200)
+check("re-entry after 1s is blocked by cooldown",
+      policy.update(80).request_ai, False)
+clock.advance(config.GEMINI_COOLDOWN_S + 1)
+policy.update(200)
+check("re-entry after the cooldown requests again",
+      policy.update(80).request_ai, True)
+
+check("the two timers are configured independently",
+      config.GEMINI_COOLDOWN_S != config.WARNING_TONE_MIN_GAP_S, True)
+
+# A tone with no description is acceptable; the local alert always wins.
+clock = FakeClock()
+policy = alerts.AlertPolicy(now=clock)
+policy.update(40)                     # tone + AI
+clock.advance(4.0)                    # past the 3s tone re-arm, inside 5s AI
+policy.update(200)
+decision = policy.update(40)
+check("local tone still fires while the AI cooldown blocks",
+      (decision.play_warning_tone, decision.request_ai), (True, False))
+
+
+# ==========================================================================
+print("\nGemini worker: queue never stacks (maxsize=1)")
+# ==========================================================================
+
+
+class FakeFrame:
+    """Stands in for a numpy frame; only .copy() is needed here."""
+
+    def __init__(self, tag="frame"):
+        self.tag = tag
+        self.copies = 0
+
+    def copy(self):
+        self.copies += 1
+        return self
+
+
+worker = vision.GeminiWorker()          # not started: no thread, no network
+check("first request is accepted", worker.request(FakeFrame("a"), 80.0), True)
+check("second request is DROPPED while one is queued",
+      worker.request(FakeFrame("b"), 79.0), False)
+check("third request is also dropped",
+      worker.request(FakeFrame("c"), 78.0), False)
+
+snap = worker.snapshot()
+check("one request counted", snap["request_count"], 1)
+check("two drops counted", snap["dropped_count"], 2)
+check("no description yet", snap["description"], None)
+
+frame = FakeFrame("d")
+worker.request(frame, 80.0)
+check("a dropped request does not copy the frame", frame.copies, 0)
+
+
+# ==========================================================================
+print("\nGemini worker: failures are absorbed, Phase 1 continues")
+# ==========================================================================
+def failing_worker(exc):
+    w = vision.GeminiWorker()
+    w._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
+
+    def boom(jpeg, distance):
+        raise exc
+
+    w._call_gemini = boom
+    return w
+
+
+for label, exc in [
+    ("connection error", OSError("Temporary failure in name resolution")),
+    ("API error", RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded")),
+    ("unexpected exception", ValueError("malformed response")),
+]:
+    w = failing_worker(exc)
+    request = vision.AiRequest(FakeFrame(), 80.0, time.monotonic())
+    raised = None
+    try:
+        w._handle(request)
+    except Exception as caught:          # must never escape the worker
+        raised = caught
+    snap = w.snapshot()
+    check("{}: nothing propagates to the caller".format(label), raised, None)
+    check("{}: recorded as an error".format(label), snap["error_count"], 1)
+    check("{}: no description shown".format(label), snap["description"], None)
+
+# An empty reply is a failure, not a description.
+w = vision.GeminiWorker()
+w._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
+w._call_gemini = lambda jpeg, distance: "   "
+w._handle(vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
+check("empty reply is not shown", w.snapshot()["description"], None)
+
+
+# ==========================================================================
+print("\nGemini worker: stale results are discarded, never displayed")
+# ==========================================================================
+w = vision.GeminiWorker()
+w._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
+w._call_gemini = lambda jpeg, distance: "Chair directly ahead."
+
+# Fresh reply -> shown.
+w._handle(vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
+check("a fresh description is shown",
+      w.snapshot()["description"], "Chair directly ahead.")
+check("one reply counted", w.snapshot()["reply_count"], 1)
+
+# The same description, once the image it came from has aged out.
+w._captured_at = time.monotonic() - (config.GEMINI_RESULT_MAX_AGE_S + 5)
+snap = w.snapshot()
+check("an aged-out description is hidden", snap["description"], None)
+check("and is reported as stale", snap["stale"], True)
+
+# A reply whose image was already too old on arrival is never stored.
+w2 = vision.GeminiWorker()
+w2._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
+w2._call_gemini = lambda jpeg, distance: "Person ahead."
+old_capture = time.monotonic() - (config.GEMINI_RESULT_MAX_AGE_S + 5)
+w2._handle(vision.AiRequest(FakeFrame(), 80.0, old_capture))
+snap = w2.snapshot()
+check("a reply born stale is discarded", snap["description"], None)
+check("and counted as discarded", snap["discarded_count"], 1)
+check("and never counted as a reply", snap["reply_count"], 0)
+
+
+# ==========================================================================
+print("\nGemini worker: replies are tidied into one short line")
+# ==========================================================================
+check("quotes stripped", vision.GeminiWorker._tidy('"Person ahead."'),
+      "Person ahead.")
+check("only the first line kept",
+      vision.GeminiWorker._tidy("Chair ahead.\nAlso a table."), "Chair ahead.")
+check("whitespace collapsed",
+      vision.GeminiWorker._tidy("  Two   people   ahead.  "),
+      "Two people ahead.")
+check("over-long replies are truncated",
+      len(vision.GeminiWorker._tidy("x" * 500)),
+      config.GEMINI_MAX_DESCRIPTION_CHARS)
+check("empty reply gives empty string", vision.GeminiWorker._tidy(None), "")
+
+
+# ==========================================================================
+print("\nAPI key handling never leaks the value")
+# ==========================================================================
+fake_env = {}
+loaded = vision.load_env_file(path=config.ENV_FILE_PATH, environ=fake_env)
+check("the real .env.local key name is found", loaded, ["GEMINI_API_KEY"])
+check("load_env_file returns names, not values",
+      all("=" not in name and len(name) < 64 for name in loaded), True)
+
+# An already-set variable must win over the file.
+preset = {"GEMINI_API_KEY": "already-set"}
+check("existing environment variables are not overwritten",
+      vision.load_env_file(path=config.ENV_FILE_PATH, environ=preset), [])
+check("and keep their original value", preset["GEMINI_API_KEY"], "already-set")
+
+check("api_key_is_present is False when unset",
+      vision.api_key_is_present(environ={}), False)
+check("api_key_is_present is False for whitespace",
+      vision.api_key_is_present(environ={"GEMINI_API_KEY": "   "}), False)
+check("api_key_is_present is True when set",
+      vision.api_key_is_present(environ={"GEMINI_API_KEY": "k"}), True)
+
 
 # ==========================================================================
 print("")

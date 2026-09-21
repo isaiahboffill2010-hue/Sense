@@ -38,7 +38,32 @@
 # longer needs lgpio.
 #
 # --------------------------------------------------------------------------
-# 3. Standard library (nothing to install)
+# 3. Gemini vision (Phase 2)  ->  pip, and ONLY this one
+# --------------------------------------------------------------------------
+# This is the single genuine pip dependency in the whole project. It is pure
+# Python, there is no apt package for it, and Google ships it on PyPI.
+#
+# Raspberry Pi OS Bookworm and newer block system-wide pip installs (PEP 668).
+# Do NOT solve that with a plain virtual environment: a plain venv cannot see
+# the apt-installed Picamera2 or the system-installed robot_hat, which would
+# break Phase 1. Use one of these instead:
+#
+#   (a) user install, leaves everything else untouched  [recommended]
+#         pip3 install --user --break-system-packages google-genai
+#
+#   (b) a venv that can still see the system packages
+#         python3 -m venv --system-site-packages ~/sense-venv
+#         ~/sense-venv/bin/pip install google-genai
+#
+# Verify before running the app:
+#     python3 smoke_test_gemini.py
+#
+google-genai>=1.0.0
+#
+# Do NOT install `google-generativeai` - that SDK is deprecated.
+#
+# --------------------------------------------------------------------------
+# 4. Standard library (nothing to install)
 # --------------------------------------------------------------------------
 # argparse, array, collections, math, os, platform, subprocess, sys,
 # threading, time, wave, pathlib

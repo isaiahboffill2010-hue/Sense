@@ -15,15 +15,19 @@ one works:
     Camera      live CSI camera preview in an OpenCV window (Picamera2)
     Ultrasonic  SunFounder module on the Robot HAT, read on its own thread
     Audio       warning beeps through the 3.5mm jack into your headphones
+    Gemini      short navigation descriptions of what the camera can see
 
 Threading model - why the preview stays smooth
 ----------------------------------------------
     main thread        camera capture + drawing + cv2.imshow + key handling
     "ultrasonic"       fires pings and waits for echoes
     "beeper"           sleeps between beeps and plays them
+    "gemini"           JPEG encoding and the network call to the API
 
-The main thread never calls time.sleep() for the beep rhythm and never waits
-for an echo, so neither the sensor nor the audio can stall the video.
+The main thread never calls time.sleep() for the beep rhythm, never waits
+for an echo, and never waits for Gemini, so none of them can stall the
+video. Gemini is strictly optional: if it fails in any way the device keeps
+behaving exactly like Phase 1.
 
 Quit with Q (or Esc, or closing the window, or Ctrl+C). Everything is shut
 down and cleaned up in a finally block either way.
@@ -52,6 +56,7 @@ RED = (40, 40, 255)
 YELLOW = (40, 215, 255)
 GREY = (170, 170, 170)
 WHITE = (255, 255, 255)
+CYAN = (255, 255, 120)      # the Gemini description line
 
 STATE_COLORS = {
     STATUS_OK: GREEN,
@@ -66,7 +71,7 @@ STATE_COLORS = {
 # ==========================================================================
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Phase 1 hardware test: camera + Robot HAT ultrasonic + headphone beeps."
+        description="Sense: camera + Robot HAT ultrasonic + headphone beeps + Gemini vision."
     )
     parser.add_argument(
         "--headless",
@@ -83,6 +88,10 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--skip-audio", action="store_true", help="do not start audio / beeps"
+    )
+    parser.add_argument(
+        "--skip-gemini", action="store_true",
+        help="do not start Gemini vision (the rest still works normally)"
     )
     parser.add_argument(
         "--force",
@@ -136,12 +145,16 @@ def format_distance(snapshot):
     return "Distance: {:.0f} cm".format(distance)
 
 
-def apply_alert_policy(policy, snapshot, beeper):
+def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None):
     """Feed the latest reading to the alert policy and act on its decision.
 
     Returns the status word to display. This is the single place where the
-    device decides whether to make a sound, so the overlay and the audio can
-    never disagree about what band we are in.
+    device decides whether to make a sound or ask Gemini, so the overlay,
+    the audio and the AI can never disagree about what band we are in.
+
+    IMPORTANT: the caller must invoke this BEFORE ui.draw_hud(), because
+    draw_hud mutates the frame in place. Queueing afterwards would send
+    Gemini an image with the HUD text burned into it.
     """
     distance = snapshot["distance_cm"] if snapshot is not None else None
     decision = policy.update(distance)
@@ -153,17 +166,27 @@ def apply_alert_policy(policy, snapshot, beeper):
         if decision.play_warning_tone:
             beeper.play_once(TONE_WARNING)
 
+    # Gemini never gates the beeps above - it is asked afterwards, and the
+    # request itself is a bounded put_nowait that cannot block.
+    if decision.request_ai and vision is not None and frame is not None:
+        vision.request(frame, distance)
+
     return decision.status
 
 
-def build_hud_lines(snapshot, status, states, audio_error):
+def build_hud_lines(snapshot, status, states, audio_error, ai=None):
     """Build the (text, colour) list drawn in the corner of the preview."""
     lines = [
         (format_distance(snapshot), WHITE),
         ("Status: {}".format(status), alerts.color_for(status)),
     ]
 
-    for label in ("Camera", "Ultrasonic", "Audio"):
+    # The description only appears while it is still current - snapshot()
+    # returns None for it once it is older than GEMINI_RESULT_MAX_AGE_S.
+    if ai is not None and ai["description"]:
+        lines.append(("AI: " + _shorten(ai["description"], 44), CYAN))
+
+    for label in ("Camera", "Ultrasonic", "Audio", "Gemini"):
         state, _detail = states[label]
         lines.append(
             ("{}: {}".format(label, state), STATE_COLORS.get(state, GREY))
@@ -174,6 +197,8 @@ def build_hud_lines(snapshot, status, states, audio_error):
         lines.append(("ULTRASONIC ERROR: " + _shorten(snapshot["error"]), RED))
     if audio_error:
         lines.append(("AUDIO ERROR: " + _shorten(audio_error), RED))
+    if ai is not None and ai["error"]:
+        lines.append(("GEMINI: " + _shorten(ai["error"]), RED))
 
     return lines
 
@@ -248,6 +273,52 @@ def start_audio(args, states):
     return player
 
 
+def start_vision(args, states):
+    """Open the Gemini worker. Returns it, or None if unavailable.
+
+    A failure here is never fatal: the device simply runs as Phase 1 did.
+    """
+    if args.skip_gemini or not config.GEMINI_ENABLED:
+        reason = "--skip-gemini" if args.skip_gemini else "GEMINI_ENABLED=False"
+        states["Gemini"] = (STATUS_SKIPPED, reason)
+        print("Gemini vision: SKIPPED ({})".format(reason))
+        return None
+
+    print("Gemini vision: checking...", flush=True)
+    import vision
+
+    # Pull .env.local into the environment. Only key NAMES are ever shown.
+    loaded = vision.load_env_file()
+    if loaded:
+        print("       loaded from .env.local: {}".format(", ".join(loaded)))
+
+    if not vision.api_key_is_present():
+        message = (
+            "{} is not set. Add it to .env.local (already gitignored) or "
+            "export it.".format(config.GEMINI_API_KEY_ENV)
+        )
+        states["Gemini"] = (STATUS_NOT_CONFIGURED, message)
+        print("Gemini vision: NOT CONFIGURED")
+        print("  " + message)
+        return None
+
+    try:
+        worker = vision.GeminiWorker().open()
+    except vision.VisionError as exc:
+        states["Gemini"] = (STATUS_FAIL, str(exc))
+        print("GEMINI ERROR: {}".format(exc))
+        return None
+    except Exception as exc:
+        states["Gemini"] = (STATUS_FAIL, "{}: {}".format(type(exc).__name__, exc))
+        print("GEMINI ERROR: {}: {}".format(type(exc).__name__, exc))
+        return None
+
+    worker.start()
+    states["Gemini"] = (STATUS_OK, worker.description)
+    print("Gemini vision: OK - {}".format(worker.description))
+    return worker
+
+
 def start_ultrasonic(args, states):
     """Open the Robot HAT ultrasonic module and start its monitor thread.
 
@@ -317,7 +388,7 @@ def update_states_from_monitor(states, monitor):
         states["Ultrasonic"] = (STATUS_OK, "recovered")
 
 
-def run_preview_loop(camera, monitor, beeper, states, policy):
+def run_preview_loop(camera, monitor, beeper, states, policy, vision=None):
     """Live OpenCV preview. Returns True if it ran, False to fall back."""
     import cv2
 
@@ -349,12 +420,19 @@ def run_preview_loop(camera, monitor, beeper, states, policy):
         fps.tick()
 
         snapshot = monitor.snapshot() if monitor is not None else None
-        status = apply_alert_policy(policy, snapshot, beeper)
+
+        # Must run BEFORE draw_hud: it may hand a copy of this still-clean
+        # frame to the Gemini worker, and draw_hud mutates the frame.
+        status = apply_alert_policy(policy, snapshot, beeper, frame, vision)
         update_states_from_monitor(states, monitor)
 
         audio_error = beeper.error if beeper is not None else None
-        ui.draw_hud(frame, build_hud_lines(snapshot, status, states, audio_error),
-                    fps=fps.value)
+        ai = vision.snapshot() if vision is not None else None
+        ui.draw_hud(
+            frame,
+            build_hud_lines(snapshot, status, states, audio_error, ai),
+            fps=fps.value,
+        )
 
         cv2.imshow(config.WINDOW_NAME, frame)
 
@@ -379,7 +457,7 @@ def run_preview_loop(camera, monitor, beeper, states, policy):
     return True
 
 
-def run_headless_loop(camera, monitor, beeper, states, policy):
+def run_headless_loop(camera, monitor, beeper, states, policy, vision=None):
     """No window: print the same information to the terminal."""
     print("")
     print("Headless mode. Press Ctrl+C to quit.")
@@ -390,10 +468,12 @@ def run_headless_loop(camera, monitor, beeper, states, policy):
     next_print = 0.0
 
     while True:
+        frame = None
         if camera is not None:
             from hardware.camera import CameraError
             try:
-                camera.read()
+                # Keep the frame: Gemini needs it, even with no window.
+                frame = camera.read()
                 fps.tick()
             except CameraError as exc:
                 if not camera_error_reported:
@@ -402,7 +482,7 @@ def run_headless_loop(camera, monitor, beeper, states, policy):
                     states["Camera"] = (STATUS_FAIL, str(exc))
 
         snapshot = monitor.snapshot() if monitor is not None else None
-        status = apply_alert_policy(policy, snapshot, beeper)
+        status = apply_alert_policy(policy, snapshot, beeper, frame, vision)
         update_states_from_monitor(states, monitor)
 
         now = time.monotonic()
@@ -417,6 +497,10 @@ def run_headless_loop(camera, monitor, beeper, states, policy):
                 _short_state(states["Audio"][0]),
                 fps_text,
             ))
+            if vision is not None:
+                ai = vision.snapshot()
+                if ai["description"]:
+                    print("   AI: {}".format(ai["description"]))
             if snapshot is not None and snapshot["error"]:
                 print("   ULTRASONIC ERROR: {}".format(snapshot["error"]))
             if beeper is not None and beeper.error:
@@ -438,7 +522,7 @@ def _short_state(state):
 # ==========================================================================
 # Shutdown
 # ==========================================================================
-def shutdown(camera, sensor, monitor, player, beeper):
+def shutdown(camera, sensor, monitor, player, beeper, vision=None):
     """Stop everything, in the safe order, and never raise while doing it."""
     print("")
     print("Cleaning up...")
@@ -446,6 +530,14 @@ def shutdown(camera, sensor, monitor, player, beeper):
     if beeper is not None:
         beeper.stop()
         print("  beeper thread stopped")
+
+    if vision is not None:
+        # Stopped early so it makes no further network calls. A request
+        # already inside the HTTP call cannot be interrupted, so stop()
+        # waits only briefly - the thread is a daemon, so a stuck socket
+        # can never prevent the program from exiting.
+        vision.stop()
+        print("  gemini thread stopped")
 
     if monitor is not None:
         monitor.stop()
@@ -495,6 +587,7 @@ def main(argv=None):
         "Camera": (STATUS_SKIPPED, ""),
         "Ultrasonic": (STATUS_SKIPPED, ""),
         "Audio": (STATUS_SKIPPED, ""),
+        "Gemini": (STATUS_SKIPPED, ""),
     }
 
     camera = None
@@ -502,6 +595,7 @@ def main(argv=None):
     monitor = None
     player = None
     beeper = None
+    vision = None
     exit_code = 0
 
     try:
@@ -514,10 +608,19 @@ def main(argv=None):
             beeper = BeepController(player)
             beeper.start()
 
+        # Gemini last: it is the only optional subsystem, and it needs the
+        # camera to be useful.
+        if camera is None and not args.skip_gemini:
+            states["Gemini"] = (STATUS_SKIPPED, "no camera")
+            print("Gemini vision: SKIPPED (no camera to send images from)")
+        else:
+            vision = start_vision(args, states)
+
         print("-" * 62)
         print("Camera     : {}".format(states["Camera"][0]))
         print("Ultrasonic : {}".format(states["Ultrasonic"][0]))
         print("Audio      : {}".format(states["Audio"][0]))
+        print("Gemini     : {}".format(states["Gemini"][0]))
         print("-" * 62)
 
         if all(state == STATUS_FAIL for state, _ in states.values()):
@@ -536,15 +639,17 @@ def main(argv=None):
 
         ran_preview = False
         if camera is not None and not args.headless:
-            ran_preview = run_preview_loop(camera, monitor, beeper, states, policy)
+            ran_preview = run_preview_loop(
+                camera, monitor, beeper, states, policy, vision
+            )
         if not ran_preview:
-            run_headless_loop(camera, monitor, beeper, states, policy)
+            run_headless_loop(camera, monitor, beeper, states, policy, vision)
 
     except KeyboardInterrupt:
         print("")
         print("Ctrl+C received - shutting down...")
     finally:
-        shutdown(camera, sensor, monitor, player, beeper)
+        shutdown(camera, sensor, monitor, player, beeper, vision)
 
     return exit_code
 
