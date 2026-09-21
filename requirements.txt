@@ -4,33 +4,50 @@
 #
 # READ THIS BEFORE RUNNING pip.
 #
-# On Raspberry Pi OS, the libraries this project needs are NOT supposed to be
-# installed with pip. Picamera2, OpenCV, lgpio and pygame all ship as tested
-# apt packages that are built against the system libcamera, SDL and kernel
-# headers. Installing them from pip instead is slow (it compiles from source
-# on a Pi 3), often fails, and can end up with a Picamera2 that cannot see
-# libcamera at all.
+# Nothing in this project is installed with `pip install -r requirements.txt`.
+# That is deliberate, not an oversight. See README.md for the full story.
 #
-# So the supported install on the Raspberry Pi is apt:
+# --------------------------------------------------------------------------
+# 1. Raspberry Pi OS packages -> apt
+# --------------------------------------------------------------------------
+# Picamera2, OpenCV and pygame ship as tested apt packages built against the
+# system libcamera, SDL and kernel headers. Installing them from pip instead
+# is slow (it compiles from source on a Pi 3), often fails, and can leave you
+# with a Picamera2 that cannot see libcamera at all.
 #
 #     sudo apt update
-#     sudo apt install -y python3-picamera2 python3-opencv python3-lgpio \
-#                         python3-pygame alsa-utils
-#
-# That is the whole dependency list. This file is deliberately almost empty,
-# and that is the correct outcome - see README.md for the full explanation.
+#     sudo apt install -y python3-picamera2 python3-opencv python3-pygame \
+#                         alsa-utils python3-smbus i2c-tools
 #
 # --------------------------------------------------------------------------
-# Standard library only (nothing to install): argparse, array, collections,
-# math, os, platform, subprocess, sys, threading, time, wave, pathlib
+# 2. SunFounder robot_hat -> installed from SunFounder's git repository
 # --------------------------------------------------------------------------
+# The ultrasonic sensor is driven through SunFounder's official Robot HAT
+# library. It is NOT on PyPI in a form that matches the board, so it must be
+# installed from source with SunFounder's own installer:
 #
-# The entries below are listed for completeness / for non-Raspberry-Pi-OS
-# systems. They are COMMENTED OUT on purpose. Do not uncomment them on
-# Raspberry Pi OS unless apt genuinely has no package for you.
+#     cd ~
+#     git clone https://github.com/sunfounder/robot-hat.git -b 2.5.x
+#     cd robot-hat
+#     sudo python3 install.py
+#
+# Do NOT `pip install robot-hat` - the PyPI name belongs to a different,
+# unofficial fork.
+#
+# robot_hat pulls in its own GPIO dependency (RPi.GPIO), so this project no
+# longer needs lgpio.
+#
+# --------------------------------------------------------------------------
+# 3. Standard library (nothing to install)
+# --------------------------------------------------------------------------
+# argparse, array, collections, math, os, platform, subprocess, sys,
+# threading, time, wave, pathlib
+#
+# --------------------------------------------------------------------------
+# The entries below are listed for completeness only, for machines that are
+# NOT running Raspberry Pi OS. They are COMMENTED OUT on purpose.
+# --------------------------------------------------------------------------
 #
 # numpy>=1.24          # pulled in automatically by python3-opencv / picamera2
 # opencv-python>=4.6   # use apt's python3-opencv on Raspberry Pi OS instead
 # pygame>=2.1          # use apt's python3-pygame on Raspberry Pi OS instead
-#
-# picamera2 and lgpio are intentionally absent: install them with apt only.

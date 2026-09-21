@@ -2,174 +2,221 @@
 hardware/ultrasonic.py
 ======================
 
-HC-SR04 ultrasonic distance sensor.
+SunFounder ultrasonic module on a SunFounder Robot HAT.
 
-How an HC-SR04 works
---------------------
-1. We hold TRIG high for 10 microseconds.
-2. The module emits an ultrasonic burst.
-3. The module raises ECHO, then lowers it again when the echo returns.
-4. The width of that ECHO pulse is the round-trip flight time:
+Why this uses robot_hat instead of raw GPIO
+-------------------------------------------
+The sensor is not a bare HC-SR04 wired to the Pi header. It is the module
+SunFounder supplies with the Robot HAT: an HC-SR04-style head with their own
+interface board on the back, plugged into the HAT's 3-pin DIGITAL ports.
 
-       distance_cm = pulse_seconds * 34300 / 2
+SunFounder ships `robot_hat`, the official library for that board, and it is
+the documented way to drive this exact sensor:
 
-   (34300 cm/s is the speed of sound; we divide by 2 because the sound
-   travelled out AND back.)
+    from robot_hat import Ultrasonic, Pin
+    ultrasonic = Ultrasonic(Pin("D2"), Pin("D3"))
+    distance = ultrasonic.read()
 
-ELECTRICAL SAFETY
------------------
-The ECHO pin of a standard 5V HC-SR04 outputs roughly 5V. Raspberry Pi GPIO
-inputs are 3.3V and are not 5V tolerant. Use a voltage divider or a level
-shifter on ECHO unless your module already shifts down to 3.3V. See config.py.
+Using it means the Robot HAT's own port names ("D2", "D3") are what appears
+in config.py, which is what is printed on the board next to the sockets - so
+the code reads the same way the hardware is labelled. The ping timing, the
+pulse measurement and the cm conversion all come from SunFounder's library.
+
+What this module adds on top
+----------------------------
+robot_hat.Ultrasonic.read() reports failure by RETURNING a negative sentinel
+(-1, and -2 in some versions) rather than raising. A returned -1 that leaked
+into the rest of the program would show up as a distance of "-1 cm" and be
+classified DANGER, which is exactly the kind of fake reading this project
+must never produce. So this module:
+
+  * translates those sentinels into a real UltrasonicError
+  * takes a median of several pings to reject spikes
+  * runs the whole thing on a background thread so the camera never waits
 
 Honesty policy
 --------------
 This module never invents a reading. If no echo comes back you get an
-UltrasonicError describing exactly what the pin did - not a fake number.
+UltrasonicError saying so - not a number.
 """
 
 import threading
 import time
 
 import config
-from .gpio_backend import GpioError, open_gpio
 
 
 class UltrasonicError(RuntimeError):
-    """Raised when a measurement fails (no echo, stuck pin, bad wiring)."""
-
-
-def _busy_wait(seconds):
-    """Spin for a very short time.
-
-    time.sleep() cannot reliably produce a 10 microsecond delay on Linux, and
-    the TRIG pulse must be at least 10us, so we burn a few CPU cycles instead.
-    """
-    end = time.perf_counter() + seconds
-    while time.perf_counter() < end:
-        pass
+    """Raised when a measurement fails (no echo, bad wiring, HAT not found)."""
 
 
 class UltrasonicSensor:
-    """Blocking, single-shot access to one HC-SR04."""
+    """Blocking, single-shot access to the Robot HAT ultrasonic module."""
 
-    def __init__(self, trig_pin, echo_pin, chip_number=None):
-        self.trig_pin = trig_pin
-        self.echo_pin = echo_pin
-        self.chip_number = config.GPIO_CHIP if chip_number is None else chip_number
-        self._gpio = None
+    def __init__(self, trig_pin=None, echo_pin=None, timeout=None):
+        # Robot HAT digital port names, e.g. "D2" / "D3".
+        self.trig_pin = config.TRIG_PIN if trig_pin is None else trig_pin
+        self.echo_pin = config.ECHO_PIN if echo_pin is None else echo_pin
+        self.timeout = config.ULTRASONIC_TIMEOUT_S if timeout is None else timeout
+        self._ultrasonic = None
 
     # ---------------------------------------------------------------- setup
     @staticmethod
     def pins_are_configured():
-        """True once TRIG_PIN and ECHO_PIN have been filled in in config.py."""
+        """True once TRIG_PIN and ECHO_PIN are set in config.py."""
         return config.TRIG_PIN is not None and config.ECHO_PIN is not None
+
+    @property
+    def description(self):
+        """e.g. 'robot_hat TRIG=D2 (GPIO27) ECHO=D3 (GPIO22)'."""
+        return "robot_hat TRIG={} ({}) ECHO={} ({})".format(
+            self.trig_pin, self._bcm_label(self.trig_pin),
+            self.echo_pin, self._bcm_label(self.echo_pin),
+        )
+
+    @staticmethod
+    def _bcm_label(pin_name):
+        bcm = config.ROBOT_HAT_PIN_TO_BCM.get(pin_name)
+        return "GPIO{}".format(bcm) if bcm is not None else "unknown GPIO"
 
     def _validate_pins(self):
         for label, pin in (("TRIG_PIN", self.trig_pin), ("ECHO_PIN", self.echo_pin)):
             if pin is None:
                 raise UltrasonicError(
-                    "{} is not set. Open config.py and set it to the BCM GPIO "
-                    "number you actually wired.".format(label)
+                    "{} is not set. Open config.py and set it to a Robot HAT "
+                    'digital port name such as "D2".'.format(label)
                 )
-            if isinstance(pin, bool) or not isinstance(pin, int):
+            if not isinstance(pin, str):
                 raise UltrasonicError(
-                    "{} must be a whole number (BCM GPIO), got {!r}.".format(label, pin)
-                )
-            if not 2 <= pin <= 27:
-                raise UltrasonicError(
-                    "{}={} is not a usable BCM GPIO number. Use 2-27 "
-                    "(BCM 0 and 1 are reserved for the HAT EEPROM).".format(label, pin)
+                    '{} must be a Robot HAT port name string such as "D2", '
+                    "got {!r}. (This project no longer takes raw BCM numbers - "
+                    "the sensor is addressed through the HAT.)".format(label, pin)
                 )
         if self.trig_pin == self.echo_pin:
             raise UltrasonicError(
-                "TRIG_PIN and ECHO_PIN are both {}. They must be different "
-                "pins.".format(self.trig_pin)
+                "TRIG_PIN and ECHO_PIN are both {!r}. They must be different "
+                "Robot HAT ports.".format(self.trig_pin)
             )
 
     def open(self):
-        """Claim the two GPIO pins. Raises UltrasonicError on any problem."""
+        """Claim the two Robot HAT ports. Raises UltrasonicError on failure."""
         self._validate_pins()
+
         try:
-            self._gpio = open_gpio(self.chip_number)
-            self._gpio.setup_output(self.trig_pin, initial=False)
-            self._gpio.setup_input(self.echo_pin)
-        except GpioError as exc:
-            raise UltrasonicError(str(exc)) from exc
+            from robot_hat import Pin, Ultrasonic
+        except ImportError as exc:
+            raise UltrasonicError(
+                "The SunFounder robot_hat library is not installed ({}).\n"
+                "  Install it on the Raspberry Pi with:\n"
+                "      cd ~\n"
+                "      git clone https://github.com/sunfounder/robot-hat.git -b 2.5.x\n"
+                "      cd robot-hat\n"
+                "      sudo python3 install.py\n"
+                "  Then check it with:\n"
+                '      python3 -c "import robot_hat; print(robot_hat.__version__)"'
+                .format(exc)
+            ) from exc
+
+        try:
+            trig = Pin(self.trig_pin)
+            echo = Pin(self.echo_pin)
         except Exception as exc:
             raise UltrasonicError(
-                "Could not claim GPIO {} (TRIG) / {} (ECHO): {}: {}".format(
+                "robot_hat could not open ports {!r}/{!r}: {}: {}\n"
+                "  Valid digital ports on the Robot HAT are D0-D3.".format(
                     self.trig_pin, self.echo_pin, type(exc).__name__, exc
                 )
             ) from exc
 
-        # The module needs a moment after power-up before it answers.
-        time.sleep(0.05)
-        return self
+        try:
+            # `timeout` is accepted by current robot_hat; older builds take
+            # only (trig, echo), so fall back rather than failing outright.
+            try:
+                self._ultrasonic = Ultrasonic(trig, echo, timeout=self.timeout)
+            except TypeError:
+                self._ultrasonic = Ultrasonic(trig, echo)
+        except Exception as exc:
+            raise UltrasonicError(
+                "robot_hat.Ultrasonic could not be created: {}: {}\n"
+                "  Is the Robot HAT seated firmly on all 40 pins, and powered?"
+                .format(type(exc).__name__, exc)
+            ) from exc
 
-    @property
-    def backend_description(self):
-        return self._gpio.description if self._gpio else "not opened"
+        time.sleep(0.05)      # let the module settle after being claimed
+        return self
 
     # ---------------------------------------------------------- measurement
     def measure_once(self):
         """Fire one ping and return the distance in cm.
 
-        Raises UltrasonicError if the sensor does not respond correctly.
+        Raises UltrasonicError if robot_hat reports a failure.
         """
-        if self._gpio is None:
+        if self._ultrasonic is None:
             raise UltrasonicError("Sensor is not open. Call open() first.")
 
-        gpio = self._gpio
-        timeout = config.SENSOR_ECHO_TIMEOUT_S
+        try:
+            # times=1 because OUR measure() already averages; letting
+            # robot_hat retry 10 times internally would stall the thread
+            # for up to a third of a second on every failed reading.
+            value = self._ultrasonic.read(times=1)
+        except Exception as exc:
+            raise UltrasonicError(
+                "robot_hat read failed: {}: {}".format(type(exc).__name__, exc)
+            ) from exc
 
-        # Make sure TRIG is low and the line is quiet before we start.
-        gpio.write(self.trig_pin, False)
-        time.sleep(config.SENSOR_SETTLE_S)
+        return self._interpret(value)
 
-        # If ECHO is already high, the previous ping never finished, or the
-        # pin is mis-wired. Wait briefly for it to clear.
-        clear_deadline = time.perf_counter() + timeout
-        while gpio.read(self.echo_pin):
-            if time.perf_counter() > clear_deadline:
-                raise UltrasonicError(
-                    "ECHO (BCM {}) is stuck HIGH before the ping. Check the "
-                    "ECHO wire, the voltage divider, and the 5V supply to the "
-                    "sensor.".format(self.echo_pin)
+    def _interpret(self, value):
+        """Turn a robot_hat return value into cm, or raise UltrasonicError.
+
+        robot_hat signals failure by returning a negative number instead of
+        raising, so this is where a fake "-1 cm" reading gets stopped.
+        """
+        if value is None:
+            raise UltrasonicError(
+                "robot_hat returned no value for ECHO ({}).".format(self.echo_pin)
+            )
+
+        if value == -1:
+            raise UltrasonicError(
+                "No echo received on ECHO {} ({}). Either nothing is within "
+                "range (~4 m), or check that the white ECHO wire is in the "
+                "yellow signal pin of the {} port and the yellow TRIG wire is "
+                "in the yellow signal pin of the {} port.".format(
+                    self.echo_pin, self._bcm_label(self.echo_pin),
+                    self.echo_pin, self.trig_pin,
                 )
+            )
 
-        # 10 microsecond trigger pulse.
-        gpio.write(self.trig_pin, True)
-        _busy_wait(0.000010)
-        gpio.write(self.trig_pin, False)
-
-        # Wait for ECHO to go HIGH: the start of the flight time.
-        rise_deadline = time.perf_counter() + timeout
-        while not gpio.read(self.echo_pin):
-            if time.perf_counter() > rise_deadline:
-                raise UltrasonicError(
-                    "No echo received - ECHO (BCM {}) never went HIGH. Check "
-                    "VCC/GND, the TRIG wire (BCM {}), and that the pin numbers "
-                    "in config.py match your wiring.".format(
-                        self.echo_pin, self.trig_pin
-                    )
+        if value == -2:
+            raise UltrasonicError(
+                "Echo pulse never ended on ECHO {} - the line stayed HIGH. "
+                "Usually a loose cable or a sensor that is not getting power "
+                "from the red VCC pin of the {} port.".format(
+                    self.echo_pin, self.trig_pin
                 )
-        start = time.perf_counter()
+            )
 
-        # Wait for ECHO to go LOW again: the end of the flight time.
-        fall_deadline = start + timeout
-        while gpio.read(self.echo_pin):
-            if time.perf_counter() > fall_deadline:
-                raise UltrasonicError(
-                    "Echo pulse never ended - ECHO (BCM {}) stayed HIGH for "
-                    "more than {:.0f} ms. Usually this means nothing reflected "
-                    "the ping, or ECHO is mis-wired.".format(
-                        self.echo_pin, timeout * 1000
-                    )
-                )
-        elapsed = time.perf_counter() - start
+        if value < 0:
+            raise UltrasonicError(
+                "robot_hat returned {} for ECHO {}, which is not a real "
+                "distance.".format(value, self.echo_pin)
+            )
 
-        return elapsed * config.SPEED_OF_SOUND_CM_S / 2.0
+        if value > config.SENSOR_IMPLAUSIBLE_ABOVE_CM:
+            # Not "very far away" - the sensor cannot see that far at all.
+            # Current robot_hat builds can return a huge number when ECHO is
+            # already HIGH as a ping starts. Reporting it would show SAFE for
+            # a sensor that is actually faulty.
+            raise UltrasonicError(
+                "Implausible reading of {:.0f} cm on ECHO {} - beyond anything "
+                "this sensor can measure. Usually the ECHO line was already "
+                "HIGH when the ping started: check the white ECHO wire in the "
+                "{} port and that the sensor has power from the red pin of the "
+                "{} port.".format(value, self.echo_pin, self.echo_pin, self.trig_pin)
+            )
+
+        return float(value)
 
     def measure(self):
         """Median of several pings - rejects the occasional wild reading.
@@ -184,7 +231,6 @@ class UltrasonicSensor:
                 samples.append(self.measure_once())
             except UltrasonicError as exc:
                 last_error = exc
-            time.sleep(0.010)     # the HC-SR04 needs a gap between pings
 
         if not samples:
             raise last_error
@@ -194,14 +240,20 @@ class UltrasonicSensor:
 
     # -------------------------------------------------------------- cleanup
     def close(self):
-        """Release the GPIO pins. Safe to call more than once."""
-        if self._gpio is not None:
-            try:
-                self._gpio.write(self.trig_pin, False)
-            except Exception:
-                pass
-            self._gpio.cleanup()
-            self._gpio = None
+        """Release the sensor. Safe to call more than once."""
+        ultrasonic, self._ultrasonic = self._ultrasonic, None
+        if ultrasonic is None:
+            return
+
+        # robot_hat has gained and lost a Pin.close() across versions, so
+        # only call it if this build actually has one.
+        for pin in (getattr(ultrasonic, "trig", None), getattr(ultrasonic, "echo", None)):
+            closer = getattr(pin, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
 
 
 class UltrasonicMonitor(threading.Thread):

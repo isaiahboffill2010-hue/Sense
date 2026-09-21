@@ -13,7 +13,7 @@ It brings up three subsystems at once and tells you honestly whether each
 one works:
 
     Camera      live CSI camera preview in an OpenCV window (Picamera2)
-    Ultrasonic  HC-SR04 distance, read continuously on its own thread
+    Ultrasonic  SunFounder module on the Robot HAT, read on its own thread
     Audio       warning beeps through the 3.5mm jack into your headphones
 
 Threading model - why the preview stays smooth
@@ -63,7 +63,7 @@ STATE_COLORS = {
 # ==========================================================================
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Phase 1 hardware test: camera + HC-SR04 + headphone beeps."
+        description="Phase 1 hardware test: camera + Robot HAT ultrasonic + headphone beeps."
     )
     parser.add_argument(
         "--headless",
@@ -75,7 +75,8 @@ def parse_args(argv=None):
         "--skip-camera", action="store_true", help="do not start the camera"
     )
     parser.add_argument(
-        "--skip-ultrasonic", action="store_true", help="do not start the HC-SR04"
+        "--skip-ultrasonic", action="store_true",
+        help="do not start the ultrasonic sensor"
     )
     parser.add_argument(
         "--skip-audio", action="store_true", help="do not start audio / beeps"
@@ -232,7 +233,7 @@ def start_audio(args, states):
 
 
 def start_ultrasonic(args, states):
-    """Open the HC-SR04 and start its monitor thread.
+    """Open the Robot HAT ultrasonic module and start its monitor thread.
 
     Returns (sensor, monitor); either may be None.
     """
@@ -249,20 +250,17 @@ def start_ultrasonic(args, states):
 
     if not UltrasonicSensor.pins_are_configured():
         message = (
-            "TRIG_PIN / ECHO_PIN are still None in config.py. Set them to the "
-            "BCM GPIO numbers you wired, then run again."
+            "TRIG_PIN / ECHO_PIN are not set in config.py. Set them to the "
+            'Robot HAT digital port names you used, e.g. "D2" and "D3".'
         )
         states["Ultrasonic"] = (STATUS_NOT_CONFIGURED, message)
         print("Ultrasonic sensor: NOT CONFIGURED")
         print("  " + message)
-        print("  Reminder: a standard 5V ECHO needs a voltage divider or level")
-        print("  shifter before it touches a 3.3V Pi GPIO pin.")
         return None, None
 
-    print("Ultrasonic sensor: checking... (TRIG=BCM {}, ECHO=BCM {})".format(
-        config.TRIG_PIN, config.ECHO_PIN), flush=True)
-
     sensor = UltrasonicSensor(config.TRIG_PIN, config.ECHO_PIN)
+    print("Ultrasonic sensor: checking... ({})".format(sensor.description),
+          flush=True)
     try:
         sensor.open()
     except UltrasonicError as exc:
@@ -279,9 +277,9 @@ def start_ultrasonic(args, states):
         print("  Starting the monitor anyway in case it recovers - watch the")
         print("  status line while you move your hand in front of the sensor.")
     else:
-        states["Ultrasonic"] = (STATUS_OK, sensor.backend_description)
+        states["Ultrasonic"] = (STATUS_OK, sensor.description)
         print("Ultrasonic sensor: OK - {} - first reading {:.1f} cm".format(
-            sensor.backend_description, first))
+            sensor.description, first))
 
     monitor = UltrasonicMonitor(sensor)
     monitor.start()
@@ -445,7 +443,7 @@ def shutdown(camera, sensor, monitor, player, beeper):
 
     if sensor is not None:
         sensor.close()
-        print("  GPIO released")
+        print("  ultrasonic sensor released")
 
     if player is not None:
         player.close()

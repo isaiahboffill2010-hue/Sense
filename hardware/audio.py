@@ -3,8 +3,14 @@ hardware/audio.py
 =================
 
 Warning beeps through the Raspberry Pi's normal audio output, i.e. through
-the 3.5mm jack into your stereo headphones. No GPIO buzzer, no speaker
-module, no internet.
+the Pi 3's own 3.5mm jack into your stereo headphones. No GPIO buzzer, no
+internet.
+
+Note on the Robot HAT: the HAT has its own onboard MONO I2S speaker but no
+headphone socket, so the headphones stay in the Pi's jack. If SunFounder's
+i2samp.sh has made the HAT speaker the default ALSA output, set
+AUDIO_DEVICE in config.py to force the beeps back to the headphones - both
+backends below honour it.
 
 Three pieces live here:
 
@@ -112,6 +118,14 @@ class _PygameBackend:
     def __init__(self, wav_path):
         # Stops pygame printing its "Hello from the pygame community" banner.
         os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+        # SDL's ALSA backend takes its device from AUDIODEV. This is how we
+        # keep the beeps in the headphones when a Robot HAT I2S speaker has
+        # taken over as the system default output.
+        if config.AUDIO_DEVICE:
+            os.environ["SDL_AUDIODRIVER"] = "alsa"
+            os.environ["AUDIODEV"] = config.AUDIO_DEVICE
+
         import pygame
 
         self._pygame = pygame
@@ -166,6 +180,12 @@ class _AplayBackend:
         self._wav_path = str(wav_path)
         self._processes = []
 
+        # "-D <device>" pins playback to one ALSA device, so a Robot HAT I2S
+        # speaker that has become the system default cannot steal the beeps.
+        self._device_args = (
+            ["-D", config.AUDIO_DEVICE] if config.AUDIO_DEVICE else []
+        )
+
         try:
             probe = subprocess.run(
                 ["aplay", "--version"],
@@ -184,13 +204,16 @@ class _AplayBackend:
             ) from exc
 
         version = probe.stdout.decode("utf-8", "replace").strip().splitlines()
-        self.description = "aplay ({})".format(version[0] if version else "alsa-utils")
+        self.description = "aplay ({}{})".format(
+            version[0] if version else "alsa-utils",
+            " -> " + config.AUDIO_DEVICE if config.AUDIO_DEVICE else "",
+        )
 
         # Actually play the file once, synchronously, so an unusable audio
         # device is reported now rather than silently swallowed later.
         try:
             result = subprocess.run(
-                ["aplay", "-q", self._wav_path],
+                ["aplay", "-q"] + self._device_args + [self._wav_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 timeout=10,
@@ -218,7 +241,7 @@ class _AplayBackend:
         try:
             self._processes.append(
                 subprocess.Popen(
-                    ["aplay", "-q", self._wav_path],
+                    ["aplay", "-q"] + self._device_args + [self._wav_path],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -275,10 +298,12 @@ class BeepPlayer:
         raise AudioError(
             "Headphone/audio output unavailable. Tried:\n  "
             + "\n  ".join(problems)
-            + "\n  Check that headphones are plugged into the 3.5mm jack and that"
-            "\n  the analogue jack (not HDMI) is the selected output."
-            "\n  List devices with:  aplay -l"
-            "\n  Choose the output with:  sudo raspi-config  ->  System Options  ->  Audio"
+            + "\n  Check that the headphones are in the Raspberry Pi's own 3.5mm jack"
+            "\n  (the Robot HAT has no headphone socket) and that the analogue jack,"
+            "\n  not HDMI or the HAT's I2S speaker, is the selected output."
+            "\n  List devices with:       aplay -l   and   aplay -L"
+            "\n  Choose the output with:  sudo raspi-config -> System Options -> Audio"
+            "\n  Or pin it explicitly by setting AUDIO_DEVICE in config.py."
         )
 
     def play(self):

@@ -78,7 +78,7 @@ def print_wrong_os_warning(info):
     print("=" * 62)
     print("  This program drives real Raspberry Pi hardware:")
     print("    - the CSI camera through Picamera2 / libcamera")
-    print("    - the HC-SR04 through the Pi's GPIO header")
+    print("    - the SunFounder ultrasonic module through the Robot HAT")
     print("")
     print("  Neither of those exists on {}.".format(info["system"]))
     print("")
