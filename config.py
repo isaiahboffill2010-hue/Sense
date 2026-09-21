@@ -82,24 +82,48 @@ ROBOT_HAT_PIN_TO_BCM = {"D0": 17, "D1": 4, "D2": 27, "D3": 22}
 
 
 # ==========================================================================
-# 2. DISTANCE THRESHOLDS AND BEEP RATES
+# 2. DISTANCE THRESHOLDS AND ALERT BEHAVIOUR
 # ==========================================================================
-# Status bands, in centimetres:
+# The device stays quiet during normal use. Sound only happens when it
+# actually tells you something new:
 #
-#     distance  > 100          -> SAFE     (no beep)
-#     50 <= distance <= 100    -> CAUTION  (slow beep)
-#     25 <= distance <  50     -> WARNING  (faster beep)
-#     distance  < 25           -> DANGER   (very fast beep)
+#     distance  > 100          -> SAFE     silent, still measuring
+#     50 <= distance <= 100    -> CAUTION  silent, obstacle tracked
+#     25 <= distance <  50     -> WARNING  ONE subtle tone when the obstacle
+#                                          FIRST enters this band, then quiet
+#     distance  < 25           -> DANGER   repeated beeps while it lasts
+#
+# So a person standing still at 30-40 cm produces one tone, not a stream of
+# them. The tone only plays again if the obstacle leaves the warning band
+# and comes back - either by moving away past the exit threshold, or by
+# coming closer into DANGER and then backing off into WARNING again.
 
 SAFE_DISTANCE_CM = 100.0      # above this -> SAFE
 CAUTION_DISTANCE_CM = 50.0    # at/above this (and <= SAFE) -> CAUTION
 WARNING_DISTANCE_CM = 25.0    # at/above this (and < CAUTION) -> WARNING
                               # below WARNING_DISTANCE_CM     -> DANGER
 
-# Seconds between beeps for each band. Smaller number = faster beeping.
-BEEP_INTERVAL_CAUTION_S = 1.00
-BEEP_INTERVAL_WARNING_S = 0.45
+# Seconds between beeps in the DANGER band. Smaller = faster beeping.
+# This is now the only band that repeats.
 BEEP_INTERVAL_DANGER_S = 0.15
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ANTI-CHATTER
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Ultrasonic readings jitter by a few cm. Without protection, an obstacle
+# sitting right on the 25 cm or 50 cm line would flip bands on every read
+# and re-trigger the tone over and over. Two guards stop that:
+#
+# 1. Hysteresis. Moving to a CLOSER band happens immediately - getting
+#    nearer is the safety-critical direction and must never be delayed.
+#    Moving BACK OUT to a further band requires clearing the boundary by
+#    this margin. With 5 cm, leaving DANGER needs > 30 cm, and leaving
+#    WARNING needs > 55 cm.
+STATUS_HYSTERESIS_CM = 5.0
+
+# 2. A re-arm delay on the warning tone. Even a legitimate re-entry will
+#    not sound again within this many seconds. Set to 0.0 to disable.
+WARNING_TONE_MIN_GAP_S = 3.0
 
 
 # ==========================================================================
@@ -153,13 +177,23 @@ WINDOW_NAME = "Navigation Headband - Phase 1 Hardware Test"
 # The beep is generated locally the first time you run the program and saved
 # as a WAV file. No internet connection is ever needed.
 
-BEEP_FREQUENCY_HZ = 1000      # pitch of the warning beep
+# --- DANGER beep: the urgent one, repeated while under 25 cm -------------
+BEEP_FREQUENCY_HZ = 1000      # pitch of the danger beep
 BEEP_DURATION_S = 0.12        # length of one beep
 BEEP_VOLUME = 0.6             # 0.0 .. 1.0, baked into the WAV file itself
 BEEP_SAMPLE_RATE = 44100      # CD quality
 BEEP_CHANNELS = 2             # 2 = stereo, identical tone in left and right
 
 BEEP_WAV_PATH = PROJECT_ROOT / "assets" / "beep.wav"
+
+# --- WARNING tone: the subtle one, played once on entering 25-50 cm ------
+# Deliberately lower and quieter than the danger beep so the two are easy
+# to tell apart by ear without looking at the screen.
+WARNING_TONE_FREQUENCY_HZ = 660
+WARNING_TONE_DURATION_S = 0.18
+WARNING_TONE_VOLUME = 0.35
+
+WARNING_TONE_WAV_PATH = PROJECT_ROOT / "assets" / "warning_tone.wav"
 
 # Play one short beep during startup so you can confirm the headphones work.
 PLAY_STARTUP_TEST_BEEP = True

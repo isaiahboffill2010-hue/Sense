@@ -12,14 +12,18 @@ i2samp.sh has made the HAT speaker the default ALSA output, set
 AUDIO_DEVICE in config.py to force the beeps back to the headphones - both
 backends below honour it.
 
+Two tones, generated locally with the standard library:
+
+    TONE_DANGER    1000 Hz, urgent   - repeated while closer than 25 cm
+    TONE_WARNING    660 Hz, subtle   - played ONCE on entering 25-50 cm
+
 Three pieces live here:
 
-    generate_beep_wav()   writes a short stereo beep to assets/beep.wav
-                          using only the Python standard library
-    BeepPlayer            opens an audio backend and plays that WAV
+    generate_all_tones()  writes both tones into assets/ as WAV files
+    BeepPlayer            opens an audio backend and plays either tone
                           without blocking the caller
-    BeepController        a background thread that repeats the beep at a
-                          chosen interval
+    BeepController        a background thread that repeats the danger beep
+                          and/or plays one-shot tones
 
 Backends, tried in order (both are real audio - nothing is simulated):
 
@@ -48,28 +52,32 @@ class AudioError(RuntimeError):
     """Raised when audio cannot be initialised or played."""
 
 
+# The two sounds this project makes.
+TONE_DANGER = "danger"     # urgent, repeated while closer than 25 cm
+TONE_WARNING = "warning"   # subtle, played once on entering 25-50 cm
+
+
 # ==========================================================================
 # Beep generation (standard library only - no numpy, no internet)
 # ==========================================================================
-def generate_beep_wav(path=None, force=False):
-    """Write a short stereo sine-wave beep to `path` and return the path.
+def generate_tone_wav(path, frequency_hz, duration_s, volume, force=False):
+    """Write a short stereo sine-wave tone to `path` and return the path.
 
-    The same tone goes into the left and the right channel, so the beep is
-    centred in stereo headphones. A 10 ms fade in and fade out removes the
-    click you would otherwise hear at the start and end of the tone.
+    The same tone goes into the left and the right channel, so it is centred
+    in stereo headphones. A 10 ms fade in and fade out removes the click you
+    would otherwise hear at the start and end of the tone.
     """
     import wave
 
-    path = path or config.BEEP_WAV_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if path.exists() and not force:
         return path
 
     sample_rate = config.BEEP_SAMPLE_RATE
-    total_samples = max(1, int(sample_rate * config.BEEP_DURATION_S))
+    total_samples = max(1, int(sample_rate * duration_s))
     fade_samples = max(1, int(sample_rate * 0.010))
-    amplitude = 32767.0 * max(0.0, min(1.0, config.BEEP_VOLUME))
+    amplitude = 32767.0 * max(0.0, min(1.0, volume))
     channels = 2 if config.BEEP_CHANNELS >= 2 else 1
 
     samples = array.array("h")
@@ -83,7 +91,7 @@ def generate_beep_wav(path=None, force=False):
             envelope = 1.0
 
         value = amplitude * envelope * math.sin(
-            2.0 * math.pi * config.BEEP_FREQUENCY_HZ * index / sample_rate
+            2.0 * math.pi * frequency_hz * index / sample_rate
         )
         sample = max(-32768, min(32767, int(value)))
         for _ in range(channels):
@@ -101,10 +109,30 @@ def generate_beep_wav(path=None, force=False):
             wav.writeframes(samples.tobytes())
     except OSError as exc:
         raise AudioError(
-            "Could not write the beep file {}: {}".format(path, exc)
+            "Could not write the tone file {}: {}".format(path, exc)
         ) from exc
 
     return path
+
+
+def generate_all_tones(force=False):
+    """Create both tones and return {tone name: path}."""
+    return {
+        TONE_DANGER: generate_tone_wav(
+            config.BEEP_WAV_PATH,
+            config.BEEP_FREQUENCY_HZ,
+            config.BEEP_DURATION_S,
+            config.BEEP_VOLUME,
+            force=force,
+        ),
+        TONE_WARNING: generate_tone_wav(
+            config.WARNING_TONE_WAV_PATH,
+            config.WARNING_TONE_FREQUENCY_HZ,
+            config.WARNING_TONE_DURATION_S,
+            config.WARNING_TONE_VOLUME,
+            force=force,
+        ),
+    }
 
 
 # ==========================================================================
@@ -115,7 +143,7 @@ class _PygameBackend:
 
     name = "pygame.mixer"
 
-    def __init__(self, wav_path):
+    def __init__(self, wav_paths):
         # Stops pygame printing its "Hello from the pygame community" banner.
         os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
@@ -146,7 +174,9 @@ class _PygameBackend:
                 "would actually reach your headphones."
             )
 
-        self._sound = pygame.mixer.Sound(str(wav_path))
+        self._sounds = {
+            tone: pygame.mixer.Sound(str(path)) for tone, path in wav_paths.items()
+        }
         self.description = "pygame.mixer / SDL ({})".format(driver or "auto")
 
     @staticmethod
@@ -160,9 +190,9 @@ class _PygameBackend:
                 pass
         return os.environ.get("SDL_AUDIODRIVER")
 
-    def play(self):
+    def play(self, tone=TONE_DANGER):
         # Sound.play() returns immediately; the mixer thread does the work.
-        self._sound.play()
+        self._sounds[tone].play()
 
     def close(self):
         try:
@@ -176,8 +206,8 @@ class _AplayBackend:
 
     name = "aplay"
 
-    def __init__(self, wav_path):
-        self._wav_path = str(wav_path)
+    def __init__(self, wav_paths):
+        self._wav_paths = {tone: str(path) for tone, path in wav_paths.items()}
         self._processes = []
 
         # "-D <device>" pins playback to one ALSA device, so a Robot HAT I2S
@@ -213,7 +243,7 @@ class _AplayBackend:
         # device is reported now rather than silently swallowed later.
         try:
             result = subprocess.run(
-                ["aplay", "-q"] + self._device_args + [self._wav_path],
+                ["aplay", "-q"] + self._device_args + [self._wav_paths[TONE_DANGER]],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 timeout=10,
@@ -233,7 +263,7 @@ class _AplayBackend:
                 )
             )
 
-    def play(self):
+    def play(self, tone=TONE_DANGER):
         # Drop finished processes so we do not leave zombies behind.
         self._processes = [p for p in self._processes if p.poll() is None]
         if len(self._processes) >= 4:
@@ -241,7 +271,7 @@ class _AplayBackend:
         try:
             self._processes.append(
                 subprocess.Popen(
-                    ["aplay", "-q"] + self._device_args + [self._wav_path],
+                    ["aplay", "-q"] + self._device_args + [self._wav_paths[tone]],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -269,20 +299,22 @@ class BeepPlayer:
 
     def __init__(self):
         self._backend = None
-        self.wav_path = None
+        self.tone_paths = {}
+        self.wav_path = None          # the danger beep, for the startup report
         self.description = "not opened"
 
     def open(self):
-        """Generate the beep and open an audio backend.
+        """Generate both tones and open an audio backend.
 
         Raises AudioError, listing what every backend said, if none work.
         """
-        self.wav_path = generate_beep_wav()
+        self.tone_paths = generate_all_tones()
+        self.wav_path = self.tone_paths[TONE_DANGER]
 
         problems = []
         for factory in (_PygameBackend, _AplayBackend):
             try:
-                self._backend = factory(self.wav_path)
+                self._backend = factory(self.tone_paths)
             except ImportError as exc:
                 problems.append("{}: not installed ({})".format(factory.name, exc))
             except AudioError as exc:
@@ -306,11 +338,11 @@ class BeepPlayer:
             "\n  Or pin it explicitly by setting AUDIO_DEVICE in config.py."
         )
 
-    def play(self):
-        """Start one beep and return immediately."""
+    def play(self, tone=TONE_DANGER):
+        """Start one tone and return immediately."""
         if self._backend is None:
             raise AudioError("Audio is not open. Call open() first.")
-        self._backend.play()
+        self._backend.play(tone)
 
     def close(self):
         if self._backend is not None:
@@ -322,16 +354,20 @@ class BeepPlayer:
 # BeepController - repeats the beep on a background thread
 # ==========================================================================
 class BeepController(threading.Thread):
-    """Repeats the beep at an interval that the main loop can change freely.
+    """Plays tones on a background thread so the camera loop never waits.
+
+    Two independent ways to make a sound:
+
+        set_interval(None)   -> stop repeating
+        set_interval(0.15)   -> repeat the danger beep every 150 ms
+        play_once(tone)      -> play one tone, as soon as possible, once
 
     All of the waiting happens on this thread, so the camera loop never has
     to call time.sleep() for the beep rhythm and never stutters because of it.
-
-    set_interval(None)  -> silence
-    set_interval(0.15)  -> a beep every 150 ms
     """
 
-    # How often we re-check the interval while silent.
+    # How often we re-check for work while not repeating a beep. Also the
+    # worst-case delay before a one-shot tone is heard.
     IDLE_POLL_S = 0.05
 
     def __init__(self, player):
@@ -340,13 +376,21 @@ class BeepController(threading.Thread):
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._interval = None
+        self._pending = []           # one-shot tones waiting to be played
         self._error = None
         self._beep_count = 0
 
     def set_interval(self, interval):
-        """Set seconds between beeps, or None for silence."""
+        """Set seconds between repeated danger beeps, or None for silence."""
         with self._lock:
             self._interval = interval
+
+    def play_once(self, tone):
+        """Queue a single tone. Returns immediately; the thread plays it."""
+        with self._lock:
+            # Never let a backlog build up if the audio device is struggling.
+            if len(self._pending) < 4:
+                self._pending.append(tone)
 
     @property
     def error(self):
@@ -360,33 +404,46 @@ class BeepController(threading.Thread):
 
     def run(self):
         while not self._stop_event.is_set():
+            # One-shots first, so a warning tone is never held up waiting
+            # for a danger beep interval to elapse.
+            with self._lock:
+                pending, self._pending = self._pending, []
+            for tone in pending:
+                self._play(tone)
+
             with self._lock:
                 interval = self._interval
 
             if interval is None:
-                # Silent: poll often so we react quickly when danger appears.
+                # Not repeating: poll often so we react quickly to new work.
                 self._stop_event.wait(self.IDLE_POLL_S)
                 continue
 
-            try:
-                self._player.play()
-            except AudioError as exc:
-                with self._lock:
-                    self._error = str(exc)
-            except Exception as exc:
-                with self._lock:
-                    self._error = "{}: {}".format(type(exc).__name__, exc)
-            else:
-                with self._lock:
-                    self._error = None
-                    self._beep_count += 1
+            self._play(TONE_DANGER)
 
             # Event.wait() returns instantly when stop() is called, so Q and
             # Ctrl+C never have to wait out a beep interval.
             self._stop_event.wait(max(0.05, interval))
 
+    def _play(self, tone):
+        """Play one tone, recording any failure instead of raising."""
+        try:
+            self._player.play(tone)
+        except AudioError as exc:
+            with self._lock:
+                self._error = str(exc)
+        except Exception as exc:
+            with self._lock:
+                self._error = "{}: {}".format(type(exc).__name__, exc)
+        else:
+            with self._lock:
+                self._error = None
+                self._beep_count += 1
+
     def stop(self, timeout=2.0):
         self.set_interval(None)
+        with self._lock:
+            self._pending = []
         self._stop_event.set()
         if self.is_alive():
             self.join(timeout=timeout)
@@ -394,5 +451,5 @@ class BeepController(threading.Thread):
 
 def play_test_beep(player):
     """One beep at startup so you can confirm the headphones really work."""
-    player.play()
+    player.play(TONE_DANGER)
     time.sleep(config.BEEP_DURATION_S + 0.05)

@@ -13,7 +13,7 @@ venv/
 env/
 
 # --- Generated at runtime on the Raspberry Pi ---
-assets/beep.wav
+assets/*.wav
 *.log
 captures/
 
@@ -24,3 +24,7 @@ captures/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# --- Secrets (Gemini API keys etc. in later phases) ---
+.env
+.env.*

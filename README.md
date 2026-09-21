@@ -17,7 +17,8 @@ at the same time:
 2. Continuously measures distance with the **SunFounder ultrasonic sensor** on
    the Robot HAT.
 3. Draws the current distance and a status word on top of the video.
-4. Plays **warning beeps through your headphones**, faster as obstacles get closer.
+4. Plays **alerts through your headphones** — one subtle tone when an
+   obstacle gets close, repeated beeps only when it gets dangerously close.
 
 The on-screen overlay looks like this:
 
@@ -36,20 +37,50 @@ The on-screen overlay looks like this:
 -----------------------------------------
 ```
 
-### Distance bands
+### Distance bands and alert behaviour
 
-| Distance | Status | Beep |
+The device stays **mostly silent during normal use**. It only makes a sound
+when it has something new to tell you.
+
+| Distance | Status | Sound |
 | --- | --- | --- |
-| more than 100 cm | `SAFE` | silent |
-| 50 – 100 cm | `CAUTION` | slow (1 beep/sec) |
-| 25 – 50 cm | `WARNING` | faster (about 2 beeps/sec) |
-| under 25 cm | `DANGER` | very fast (about 6 beeps/sec) |
+| more than 100 cm | `SAFE` | silent, still measuring |
+| 50 – 100 cm | `CAUTION` | silent, obstacle tracked |
+| 25 – 50 cm | `WARNING` | **one** subtle 660 Hz tone on entering the band, then quiet |
+| under 25 cm | `DANGER` | repeated 1000 Hz beeps while it lasts |
 | no valid reading | `UNKNOWN` | silent |
 
-All four thresholds and all three beep rates live in [config.py](config.py).
+So a family member standing in front of you at 30–40 cm produces **one tone,
+not a stream of them**. The tone plays again only if the obstacle leaves the
+warning band and comes back — either by moving away, or by coming closer into
+`DANGER` and then backing off again.
+
+The two sounds are deliberately different so you can tell them apart without
+looking: the warning tone is lower and quieter, the danger beep is higher and
+more urgent.
+
+#### Anti-chatter
+
+Ultrasonic readings jitter by a few cm, so an obstacle sitting right on the
+25 cm or 50 cm line would otherwise flip bands on every read. Two guards
+prevent that, both in [config.py](config.py):
+
+- **`STATUS_HYSTERESIS_CM = 5.0`** — moving to a *closer* band is reported
+  immediately, because getting nearer is the safety-critical direction. Moving
+  *back out* requires clearing the boundary by 5 cm, so leaving `DANGER` needs
+  more than 30 cm and leaving `WARNING` needs more than 55 cm.
+- **`WARNING_TONE_MIN_GAP_S = 3.0`** — even a legitimate re-entry will not
+  sound again within 3 seconds. Set it to `0.0` to disable.
 
 `UNKNOWN` is deliberately silent. If the sensor stops answering, the program
 says so — it never guesses a distance and never fakes a "safe" reading.
+
+This logic is covered by [test_alerts.py](test_alerts.py), which needs no
+hardware:
+
+```bash
+python3 test_alerts.py
+```
 
 ---
 
@@ -466,7 +497,8 @@ hardware/
     ultrasonic.py       SunFounder sensor via robot_hat + background reader thread
     audio.py            beep generation + playback + the beeper thread
 
-assets/                 beep.wav is generated here on first run
+assets/                 beep.wav and warning_tone.wav generated on first run
+test_alerts.py          hardware-free tests for the alert behaviour
 requirements.txt        explains why pip is not used here
 ```
 
@@ -478,7 +510,7 @@ Three threads, so nothing blocks the video:
 | --- | --- |
 | main thread | capture frames, draw the overlay, `cv2.imshow`, handle keys |
 | `ultrasonic` | fire pings through `robot_hat`, publish the latest reading |
-| `beeper` | sleep between beeps and play them |
+| `beeper` | sleep between danger beeps, and play one-shot warning tones |
 
 The main loop never calls `time.sleep()` for the beep rhythm and never waits
 for an echo. It just reads the latest sensor snapshot and tells the beeper

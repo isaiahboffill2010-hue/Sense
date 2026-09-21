@@ -37,6 +37,9 @@ import time
 import alerts
 import config
 import diagnostics
+# Tone name constant only; hardware.audio imports no audio library at
+# module level, so this is still safe to import on a non-Pi machine.
+from hardware.audio import TONE_WARNING
 
 # Subsystem status words shown in the overlay and the startup report.
 STATUS_OK = "OK"
@@ -133,11 +136,24 @@ def format_distance(snapshot):
     return "Distance: {:.0f} cm".format(distance)
 
 
-def current_status(snapshot):
-    """Status word for the current reading (UNKNOWN when there is no reading)."""
-    if snapshot is None:
-        return alerts.UNKNOWN
-    return alerts.classify(snapshot["distance_cm"])
+def apply_alert_policy(policy, snapshot, beeper):
+    """Feed the latest reading to the alert policy and act on its decision.
+
+    Returns the status word to display. This is the single place where the
+    device decides whether to make a sound, so the overlay and the audio can
+    never disagree about what band we are in.
+    """
+    distance = snapshot["distance_cm"] if snapshot is not None else None
+    decision = policy.update(distance)
+
+    if beeper is not None:
+        # Repeated beeps: only DANGER sets a non-None interval.
+        beeper.set_interval(decision.repeat_interval)
+        # One subtle tone, exactly on entering the WARNING band.
+        if decision.play_warning_tone:
+            beeper.play_once(TONE_WARNING)
+
+    return decision.status
 
 
 def build_hud_lines(snapshot, status, states, audio_error):
@@ -301,7 +317,7 @@ def update_states_from_monitor(states, monitor):
         states["Ultrasonic"] = (STATUS_OK, "recovered")
 
 
-def run_preview_loop(camera, monitor, beeper, states):
+def run_preview_loop(camera, monitor, beeper, states, policy):
     """Live OpenCV preview. Returns True if it ran, False to fall back."""
     import cv2
 
@@ -333,11 +349,8 @@ def run_preview_loop(camera, monitor, beeper, states):
         fps.tick()
 
         snapshot = monitor.snapshot() if monitor is not None else None
-        status = current_status(snapshot)
+        status = apply_alert_policy(policy, snapshot, beeper)
         update_states_from_monitor(states, monitor)
-
-        if beeper is not None:
-            beeper.set_interval(alerts.beep_interval_for(status))
 
         audio_error = beeper.error if beeper is not None else None
         ui.draw_hud(frame, build_hud_lines(snapshot, status, states, audio_error),
@@ -366,7 +379,7 @@ def run_preview_loop(camera, monitor, beeper, states):
     return True
 
 
-def run_headless_loop(camera, monitor, beeper, states):
+def run_headless_loop(camera, monitor, beeper, states, policy):
     """No window: print the same information to the terminal."""
     print("")
     print("Headless mode. Press Ctrl+C to quit.")
@@ -389,11 +402,8 @@ def run_headless_loop(camera, monitor, beeper, states):
                     states["Camera"] = (STATUS_FAIL, str(exc))
 
         snapshot = monitor.snapshot() if monitor is not None else None
-        status = current_status(snapshot)
+        status = apply_alert_policy(policy, snapshot, beeper)
         update_states_from_monitor(states, monitor)
-
-        if beeper is not None:
-            beeper.set_interval(alerts.beep_interval_for(status))
 
         now = time.monotonic()
         if now >= next_print:
@@ -521,11 +531,14 @@ def main(argv=None):
             print("unavailable or skipped. Fix the items above and try again.")
             return 1
 
+        # One policy shared by both loops: it owns all the alert state.
+        policy = alerts.AlertPolicy()
+
         ran_preview = False
         if camera is not None and not args.headless:
-            ran_preview = run_preview_loop(camera, monitor, beeper, states)
+            ran_preview = run_preview_loop(camera, monitor, beeper, states, policy)
         if not ran_preview:
-            run_headless_loop(camera, monitor, beeper, states)
+            run_headless_loop(camera, monitor, beeper, states, policy)
 
     except KeyboardInterrupt:
         print("")
