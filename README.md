@@ -2,9 +2,8 @@
 
 A prototype wearable navigation aid for blind and low-vision users.
 
-**Phase 1 (hardware) and Phase 2 (Gemini vision) are implemented.**
-There is no speech output yet — Gemini's descriptions appear in the terminal
-and on the preview HUD. Text-to-speech comes in a later phase.
+**Phases 1–3 are implemented:** hardware, Gemini vision, and spoken
+navigation guidance through the headphones.
 
 ---
 
@@ -19,8 +18,9 @@ at the same time:
 3. Draws the current distance and a status word on top of the video.
 4. Plays **alerts through your headphones** — one subtle tone when an
    obstacle gets close, repeated beeps only when it gets dangerously close.
-5. Asks **Gemini** for a very short description of what is ahead, once per
-   approach, and shows it as `AI: Person ahead.`
+5. Asks **Gemini** for short navigation guidance — what the obstacle is,
+   where it sits, and which way to move — and **speaks it** through the
+   headphones: `Person ahead, slightly left.`
 
 The on-screen overlay looks like this:
 
@@ -32,14 +32,20 @@ The on-screen overlay looks like this:
 |                                       |
 | Distance: 72 cm                       |
 | Status: CAUTION                       |
-| AI: Person ahead.                     |
+| AI: Person ahead, slightly left.      |
 | Camera: OK                            |
 | Ultrasonic: OK                        |
 | Audio: OK                             |
 | Gemini: OK                            |
+| Speech: OK                            |
+| AI IDLE  1.4s  req 3 ok 2 rej 1       |
 | Press Q to quit                       |
 -----------------------------------------
 ```
+
+The `AI` activity line is there for bench testing: worker state
+(`IDLE` / `THINKING` / `DISCARDED`), the last round-trip time, and counts of
+requests, accepted replies and rejected ones.
 
 ### Distance bands and alert behaviour
 
@@ -95,13 +101,19 @@ the camera frame it already has to a background thread, which asks Gemini for
 one short navigation phrase.
 
 ```
-AI: Person ahead.
-AI: Two people ahead.
-AI: Chair directly ahead.
-AI: Closed door ahead.
-AI: Stairs descending ahead.
+AI: Person ahead, slightly left.
+AI: Chair ahead, move right.
+AI: Doorway ahead on the right.
+AI: Table leg ahead, move left.
+AI: Obstacle ahead.            <- when the frame does not show a safe way
 AI: Path clear.
 ```
+
+The **ultrasonic distance is put into the prompt**, so the model is never
+asked to estimate distance — it only has to identify the obstacle and where
+it sits in the frame. It is also explicitly forbidden from inventing a
+direction: if the image does not clearly show which way is safe, it must
+reply `Obstacle ahead.`
 
 **Gemini is strictly optional.** No internet, a timeout, an API error, a quota
 limit, a malformed reply — none of it can delay or suppress the ultrasonic
@@ -110,9 +122,19 @@ exactly as it did in Phase 1 and simply shows no description.
 
 ### When it asks
 
-One analysis per approach, triggered when an obstacle steps **up** in severity
-into `CAUTION`, `WARNING` or `DANGER`, and rate-limited by a single global
-`GEMINI_COOLDOWN_S = 5.0` cooldown.
+Three triggers, all rate-limited by a single global
+`GEMINI_COOLDOWN_S = 5.0` cooldown, and all reported in the terminal so you
+can see which one fired:
+
+| Reason | Fires when |
+| --- | --- |
+| `band` | an obstacle steps **up** in severity into `CAUTION`, `WARNING` or `DANGER` |
+| `moved` | the distance changes by `GEMINI_DISTANCE_CHANGE_CM = 25` without changing band |
+| `refresh` | an obstacle has persisted for `GEMINI_REFRESH_S = 15` seconds |
+
+The distance-change threshold is far above ultrasonic jitter, so noise cannot
+spend a request, but walking from 95 cm to 60 cm is a genuinely different
+scene and earns a fresh look.
 
 In an ordinary walk-up (`SAFE → CAUTION → WARNING → DANGER`) only the
 **CAUTION** entry actually reaches the API — the later steps follow within a
@@ -128,20 +150,53 @@ analysed.
 
 Moving **away** never triggers a request.
 
-### Stale descriptions are discarded
+### Relevance, not a stopwatch
 
-Age is measured from the moment the **image was captured**, not from when the
-reply arrived. A description older than `GEMINI_RESULT_MAX_AGE_S = 4.0`
-seconds is thrown away instead of shown, so `Chair ahead.` can never appear
-eight seconds after you have already walked past the chair. This applies both
-when a reply arrives late and while a description is sitting on screen.
+A slow reply is not automatically a *wrong* reply. "Chair ahead, move right"
+that took six seconds is still correct if the chair is still 45 cm ahead — it
+is only wrong if the world moved on. So every request carries a **request id,
+the distance at capture, the band at capture and a timestamp**, and a finished
+reply is rejected if:
+
+1. **a newer request exists** — newest always wins;
+2. **the obstacle is gone** — the band is now `SAFE` or `UNKNOWN`;
+3. **the scene changed** — the distance moved by more than
+   `GEMINI_RELEVANCE_DISTANCE_CM = 30`;
+4. **it is older than `GEMINI_ACCEPT_MAX_AGE_S = 12` s** — a last-resort
+   backstop for a hung socket, deliberately generous because rules 1–3 do the
+   real work.
+
+Rejections print the reason (`GEMINI discarded: superseded by request #7`) and
+show as `DISCARDED` on the HUD. They are **not** counted as errors — throwing
+away obsolete guidance is the system working.
 
 ### Nothing stacks up
 
-The request queue holds exactly **one** item. If an analysis is already queued
-or in flight, a new request is dropped rather than added. JPEG encoding and
-the network call both happen on the worker thread, never on the camera/UI
-thread.
+The queue holds at most **one** item, and the **newest request wins**: a new
+request replaces whatever was waiting, and an older reply still in flight is
+recognised by its id and thrown away when it arrives. There is deliberately no
+backlog.
+
+### Latency
+
+Four things keep the round trip short, since a fast reply is a relevant reply:
+
+- frames are downscaled to `GEMINI_SEND_RESOLUTION = (512, 384)` before
+  encoding. Token cost is flat — anything up to 768×768 is one 258-token tile
+  — but the **bytes on the wire** are not, and on a Pi 3's Wi-Fi the upload is
+  a real slice of the round trip;
+- `GEMINI_MAX_OUTPUT_TOKENS = 48` stops the model generating prose we discard;
+- `GEMINI_DISABLE_THINKING = True` skips hidden reasoning tokens, which are
+  pure latency for a six-word answer;
+- `GEMINI_PREWARM = True` makes one tiny throwaway call on the worker thread
+  at startup, so DNS, TLS and the connection pool are warm before the first
+  real obstacle.
+
+The terminal logs each accepted reply with its timing breakdown:
+
+```
+AI: Chair ahead, move right.   [58cm CAUTION via band  enc 12ms  api 1420ms  age 1.5s]
+```
 
 ### Cost
 
@@ -149,6 +204,49 @@ A 640×480 frame fits in a single 768×768 tile = 258 image tokens. With the
 prompt and a short reply that is roughly **$0.0001 per call** on
 `gemini-3.5-flash-lite`. Even saturating the 5 s cooldown for a solid hour is
 about 8 cents. There is also a free tier.
+
+---
+
+## Spoken guidance (Phase 3)
+
+Accepted guidance is spoken through the same headphones as the beeps, using a
+**local offline** engine — no cloud TTS, nothing added to the Gemini round
+trip.
+
+Backends are tried in order; the first one present is used:
+
+```bash
+sudo apt install -y espeak-ng          # preferred
+# fallbacks: espeak, or libttspico-utils (pico2wave)
+```
+
+If none is installed, the HUD shows `Speech: FAIL` with the install command
+and **everything else keeps working, beeps included**.
+
+### Safety: danger always wins
+
+Speech runs on its own thread, separate from the beeps, for one reason: a
+spoken phrase takes a second or two and a danger beep must never queue behind
+it.
+
+- The beeps are driven **straight from the ultrasonic reading**, first, every
+  frame. They never wait on Gemini or on speech.
+- Entering `DANGER` **silences speech and cuts off any phrase mid-word**
+  (`SPEECH_MUTE_IN_DANGER`), so the rapid danger beeps are never competing
+  with a sentence.
+- Gemini is supplemental scene understanding. It is not, and must never
+  become, part of the collision-detection path.
+
+### No repetition
+
+Two independent guards stop Sense nagging:
+
+- guidance is spoken only when the worker **accepts a new result**, not once
+  per frame;
+- the same phrase is not repeated within `SPEECH_DUPLICATE_GAP_S = 12` s, so
+  standing in a doorway does not produce "Doorway right." over and over.
+
+`--skip-speech` disables speech entirely; beeps and the HUD are unaffected.
 
 ---
 
@@ -229,7 +327,7 @@ build on a Pi 3 or end up unable to see libcamera.
 ```bash
 sudo apt update
 sudo apt install -y python3-picamera2 python3-opencv python3-pygame alsa-utils \
-                    git python3-pip python3-setuptools python3-smbus i2c-tools
+                    git python3-pip python3-setuptools python3-smbus i2c-tools espeak-ng
 ```
 
 | Package | Why |
@@ -239,6 +337,7 @@ sudo apt install -y python3-picamera2 python3-opencv python3-pygame alsa-utils \
 | `python3-pygame` | low-latency beep playback |
 | `alsa-utils` | provides `aplay`, the fallback audio backend and a test tool |
 | `python3-smbus`, `i2c-tools` | I²C support the Robot HAT library needs |
+| `espeak-ng` | offline text-to-speech for the spoken guidance |
 
 ### 2. SunFounder `robot_hat` (from SunFounder's git repository)
 
@@ -389,7 +488,7 @@ On the **Raspberry Pi** (not on your Windows PC):
 # 1. system packages
 sudo apt update
 sudo apt install -y python3-picamera2 python3-opencv python3-pygame alsa-utils \
-                    git python3-pip python3-setuptools python3-smbus i2c-tools
+                    git python3-pip python3-setuptools python3-smbus i2c-tools espeak-ng
 
 # 2. SunFounder Robot HAT library
 cd ~
@@ -476,7 +575,8 @@ Gemini vision: OK - gemini-3.5-flash-lite (SDK timeout 8000 ms)
 | `python3 main.py --skip-camera` | test only the sensor and the beeps |
 | `python3 main.py --skip-ultrasonic` | test only the camera and the beeps |
 | `python3 main.py --skip-audio` | test silently |
-| `python3 main.py --skip-gemini` | run Phase 1 only, no API calls |
+| `python3 main.py --skip-gemini` | run without Gemini, no API calls |
+| `python3 main.py --skip-speech` | silence spoken guidance, keep the beeps |
 | `python3 main.py --help` | list all options |
 
 ---
@@ -630,7 +730,7 @@ hardware/
     ultrasonic.py       SunFounder sensor via robot_hat + background reader thread
     audio.py            beep generation + playback + the beeper thread
 
-vision.py               Gemini worker thread, .env loader, staleness rules
+vision.py               Gemini worker thread, .env loader, relevance rules
 
 assets/                 beep.wav and warning_tone.wav generated on first run
 test_alerts.py          hardware-free tests for alerts + the Gemini logic
@@ -648,6 +748,7 @@ Three threads, so nothing blocks the video:
 | `ultrasonic` | fire pings through `robot_hat`, publish the latest reading |
 | `beeper` | sleep between danger beeps, and play one-shot warning tones |
 | `gemini` | JPEG-encode a frame copy and call the API |
+| `speech` | speak accepted guidance, and stop mid-phrase on danger |
 
 The main loop never calls `time.sleep()` for the beep rhythm and never waits
 for an echo. It just reads the latest sensor snapshot and tells the beeper
@@ -675,7 +776,5 @@ never look like a very close obstacle.
 
 ## Roadmap — not built yet
 
-Later phases will add spoken output (text-to-speech) for the Gemini
-descriptions, richer obstacle warnings, and possibly GPS navigation.
-**None of that is in this repository yet.** Gemini's descriptions currently
-appear only in the terminal and on the HUD.
+Possible later work: GPS navigation, richer multi-obstacle handling, and
+tuning the voice. Not in this repository yet.

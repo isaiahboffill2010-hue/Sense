@@ -17,7 +17,11 @@
 #
 #     sudo apt update
 #     sudo apt install -y python3-picamera2 python3-opencv python3-pygame \
-#                         alsa-utils python3-smbus i2c-tools
+#                         alsa-utils python3-smbus i2c-tools espeak-ng
+#
+# espeak-ng provides the offline text-to-speech used for spoken
+# navigation guidance. Without it the HUD says "Speech: FAIL" and
+# everything else, beeps included, carries on normally.
 #
 # --------------------------------------------------------------------------
 # 2. SunFounder robot_hat -> installed from SunFounder's git repository

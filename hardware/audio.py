@@ -453,3 +453,342 @@ def play_test_beep(player):
     """One beep at startup so you can confirm the headphones really work."""
     player.play(TONE_DANGER)
     time.sleep(config.BEEP_DURATION_S + 0.05)
+
+# ==========================================================================
+# SPOKEN NAVIGATION  (Phase 3)
+# ==========================================================================
+# Gemini's accepted guidance is spoken through the same headphones as the
+# beeps, using a LOCAL offline text-to-speech engine. Nothing here touches
+# the network, and nothing here is part of the Gemini round trip.
+#
+# The beep classes above are deliberately untouched. Speech gets its own
+# player and its own thread, for one reason: a spoken phrase takes one or
+# two seconds, and a danger beep must never queue behind it. Keeping them
+# on separate threads means the beeps cannot be delayed at all, and the
+# speech thread can be silenced mid-phrase when danger appears.
+#
+# Backends, tried in order. All are offline; none is simulated:
+#
+#   1. espeak-ng    sudo apt install -y espeak-ng      (preferred)
+#   2. espeak       sudo apt install -y espeak         (older name)
+#   3. pico2wave    sudo apt install -y libttspico-utils
+#
+# If none is present, open() raises AudioError with the install command and
+# the rest of the device carries on exactly as before - beeps included.
+
+SPEECH_BACKENDS = ("espeak-ng", "espeak", "pico2wave")
+
+
+def _clean_for_speech(text):
+    """Collapse a phrase into something safe and short to speak."""
+    if not text:
+        return ""
+    # One line, no control characters, no runaway whitespace.
+    single = " ".join(str(text).split())
+    single = "".join(ch for ch in single if ch.isprintable())
+    limit = config.SPEECH_MAX_CHARS
+    if len(single) > limit:
+        single = single[:limit].rstrip()
+    return single
+
+
+class SpeechPlayer:
+    """Speaks short phrases through the headphones, without blocking.
+
+    speak() starts a subprocess and returns immediately. stop() cuts the
+    current phrase off mid-word, which is what makes danger interruption
+    possible.
+    """
+
+    def __init__(self):
+        self._command = None        # e.g. "espeak-ng"
+        self._processes = []
+        self._wav_path = None       # only used by the pico2wave backend
+        self.description = "not opened"
+
+    # ---------------------------------------------------------------- setup
+    def open(self):
+        """Find a working TTS engine. Raises AudioError if there is none."""
+        problems = []
+        for command in SPEECH_BACKENDS:
+            try:
+                probe = subprocess.run(
+                    [command, "--version"] if command != "pico2wave" else
+                    [command, "--help"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                )
+            except FileNotFoundError:
+                problems.append("{}: not installed".format(command))
+                continue
+            except Exception as exc:
+                problems.append("{}: {}: {}".format(
+                    command, type(exc).__name__, exc))
+                continue
+
+            # pico2wave --help exits non-zero on some builds; presence is
+            # what we actually care about for all of them.
+            version = probe.stdout.decode("utf-8", "replace").strip()
+            first_line = version.splitlines()[0] if version else command
+            self._command = command
+            self.description = "{} ({}{})".format(
+                command,
+                first_line[:40],
+                " -> " + config.AUDIO_DEVICE if config.AUDIO_DEVICE else "",
+            )
+            if command == "pico2wave":
+                self._wav_path = str(config.PROJECT_ROOT / "assets" / "speech.wav")
+            return self
+
+        raise AudioError(
+            "No offline text-to-speech engine found. Tried:\n  "
+            + "\n  ".join(problems)
+            + "\n  Install one with:  sudo apt install -y espeak-ng"
+            "\n  Beeps and everything else keep working without it."
+        )
+
+    @property
+    def command(self):
+        return self._command
+
+    # -------------------------------------------------------------- playback
+    def speak(self, text):
+        """Start speaking `text`. Returns immediately.
+
+        Any phrase already in progress is cut off first - the newest
+        guidance is always the relevant one.
+        """
+        if self._command is None:
+            raise AudioError("Speech is not open. Call open() first.")
+
+        phrase = _clean_for_speech(text)
+        if not phrase:
+            return False
+
+        self.stop()          # never overlap two voices
+
+        try:
+            self._processes = self._spawn(phrase)
+        except Exception as exc:
+            raise AudioError(
+                "{} failed: {}: {}".format(
+                    self._command, type(exc).__name__, exc)
+            ) from exc
+        return True
+
+    def _spawn(self, phrase):
+        """Launch the backend. Returns the list of processes to track."""
+        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+
+        if self._command == "pico2wave":
+            # Two steps: synthesise to a WAV, then play it with aplay, which
+            # is also how we honour AUDIO_DEVICE for this backend.
+            subprocess.run(
+                [self._command, "-w", self._wav_path, phrase],
+                timeout=15, **quiet
+            )
+            play = ["aplay", "-q"]
+            if config.AUDIO_DEVICE:
+                play += ["-D", config.AUDIO_DEVICE]
+            return [subprocess.Popen(play + [self._wav_path], **quiet)]
+
+        rate = ["-s", str(int(config.SPEECH_RATE_WPM))]
+        amp = ["-a", str(int(config.SPEECH_VOLUME))]
+
+        if config.AUDIO_DEVICE:
+            # espeak has no ALSA device option, so send WAV to stdout and let
+            # aplay put it on the device we actually want. This is what keeps
+            # speech out of a Robot HAT I2S speaker when the beeps are
+            # already pinned to the headphone jack.
+            speaker = subprocess.Popen(
+                [self._command, "--stdout"] + rate + amp + [phrase],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            player = subprocess.Popen(
+                ["aplay", "-q", "-D", config.AUDIO_DEVICE],
+                stdin=speaker.stdout, **quiet
+            )
+            # Let the first process see EOF when the second one exits.
+            speaker.stdout.close()
+            return [speaker, player]
+
+        return [subprocess.Popen(
+            [self._command] + rate + amp + [phrase], **quiet)]
+
+    def is_speaking(self):
+        """True while a phrase is still being produced."""
+        self._processes = [pr for pr in self._processes if pr.poll() is None]
+        return bool(self._processes)
+
+    def stop(self):
+        """Cut off the current phrase immediately. Safe to call any time."""
+        for process in self._processes:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+        self._processes = []
+
+    def close(self):
+        self.stop()
+        self._command = None
+
+
+class SpeechController(threading.Thread):
+    """Speaks the newest guidance, once, without ever blocking the caller.
+
+    Behaviour that matters:
+
+      * NEWEST WINS. say() replaces anything still waiting. Old navigation
+        advice is worthless, so there is no queue to back up.
+      * NO REPEATS. The same phrase is not spoken again within
+        SPEECH_DUPLICATE_GAP_S, so standing in a doorway does not produce
+        "Doorway right." over and over.
+      * DANGER INTERRUPTS. set_muted(True) cuts off the current phrase
+        within ~50 ms and drops anything pending, so the rapid danger beeps
+        are never competing with a sentence.
+
+    Attribute names here deliberately avoid everything threading.Thread
+    uses internally - see the guard in test_alerts.py.
+    """
+
+    POLL_S = 0.05
+
+    def __init__(self, player, now=None):
+        super().__init__(name="speech", daemon=True)
+        self._player = player
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._now = now or time.monotonic
+
+        self._pending_text = None
+        self._muted = False
+        self._last_text = None
+        self._last_spoken_at = None
+        self._spoken_count = 0
+        self._suppressed_count = 0
+        self._error = None
+
+    # ------------------------------------------------------------- requests
+    def say(self, text):
+        """Queue a phrase. Returns True if it was accepted for speaking."""
+        phrase = _clean_for_speech(text)
+        if not phrase:
+            return False
+
+        with self._lock:
+            if self._muted:
+                self._suppressed_count += 1
+                return False
+
+            gap = config.SPEECH_DUPLICATE_GAP_S
+            if (
+                gap > 0
+                and phrase == self._last_text
+                and self._last_spoken_at is not None
+                and (self._now() - self._last_spoken_at) < gap
+            ):
+                self._suppressed_count += 1
+                return False
+
+            # Newest wins: whatever was waiting is replaced, not queued.
+            self._pending_text = phrase
+        return True
+
+    def set_muted(self, muted):
+        """Silence (True) or re-enable (False) speech.
+
+        Muting also cuts off a phrase already in progress. The main loop
+        calls this with `status == DANGER` so the danger beeps always win.
+        """
+        with self._lock:
+            changed = muted != self._muted
+            self._muted = bool(muted)
+            if muted:
+                self._pending_text = None
+        if muted and changed:
+            self._player.stop()
+
+    @property
+    def muted(self):
+        with self._lock:
+            return self._muted
+
+    @property
+    def error(self):
+        with self._lock:
+            return self._error
+
+    @property
+    def spoken_count(self):
+        with self._lock:
+            return self._spoken_count
+
+    @property
+    def suppressed_count(self):
+        with self._lock:
+            return self._suppressed_count
+
+    @property
+    def last_spoken(self):
+        with self._lock:
+            return self._last_text
+
+    # ------------------------------------------------------------ main loop
+    def run(self):
+        while not self._stop_event.is_set():
+            with self._lock:
+                text = self._pending_text
+                muted = self._muted
+                if text is not None and not muted:
+                    self._pending_text = None
+
+            if muted or text is None:
+                self._stop_event.wait(self.POLL_S)
+                continue
+
+            self._speak_now(text)
+
+    def _speak_now(self, text):
+        """Speak one phrase, abandoning it if danger or shutdown arrives."""
+        try:
+            self._player.speak(text)
+        except AudioError as exc:
+            with self._lock:
+                self._error = str(exc)
+            return
+        except Exception as exc:
+            with self._lock:
+                self._error = "{}: {}".format(type(exc).__name__, exc)
+            return
+
+        with self._lock:
+            self._error = None
+            self._last_text = text
+            self._last_spoken_at = self._now()
+            self._spoken_count += 1
+
+        # Wait for it to finish, but stay responsive to mute and shutdown.
+        while self._player.is_speaking():
+            if self._stop_event.is_set() or self.muted:
+                self._player.stop()
+                break
+            self._stop_event.wait(self.POLL_S)
+
+    def stop(self, timeout=2.0):
+        self._stop_event.set()
+        with self._lock:
+            self._pending_text = None
+        try:
+            self._player.stop()
+        except Exception:
+            pass
+        if self.is_alive():
+            self.join(timeout=timeout)
+
+
+def speak_startup_phrase(controller, phrase="Sense ready."):
+    """Say one phrase at startup so you can confirm TTS actually works."""
+    controller.say(phrase)

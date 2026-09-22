@@ -29,7 +29,13 @@ import time
 import alerts
 import config
 import vision
-from hardware.audio import TONE_DANGER, TONE_WARNING, BeepController
+from hardware.audio import (
+    TONE_DANGER,
+    TONE_WARNING,
+    BeepController,
+    SpeechController,
+    _clean_for_speech,
+)
 from hardware.ultrasonic import UltrasonicMonitor
 
 FAILURES = []
@@ -294,8 +300,12 @@ check("local tone still fires while the AI cooldown blocks",
 
 
 # ==========================================================================
-print("\nGemini worker: queue never stacks (maxsize=1)")
+print("\nGemini worker: the queue holds at most one item")
 # ==========================================================================
+# Phase 2 dropped a NEW request while one was in flight. Phase 3 reversed
+# that: the newest request always wins, because old navigation advice is
+# worthless. Either way nothing is ever allowed to back up - the detailed
+# newest-wins checks live in their own section further down.
 
 
 class FakeFrame:
@@ -311,20 +321,14 @@ class FakeFrame:
 
 
 worker = vision.GeminiWorker()          # not started: no thread, no network
-check("first request is accepted", worker.request(FakeFrame("a"), 80.0), True)
-check("second request is DROPPED while one is queued",
-      worker.request(FakeFrame("b"), 79.0), False)
-check("third request is also dropped",
-      worker.request(FakeFrame("c"), 78.0), False)
+for tag, distance in (("a", 80.0), ("b", 79.0), ("c", 78.0)):
+    worker.request(FakeFrame(tag), distance, "CAUTION", "band")
 
+check("the queue never exceeds one item", worker._queue.qsize(), 1)
 snap = worker.snapshot()
-check("one request counted", snap["request_count"], 1)
-check("two drops counted", snap["dropped_count"], 2)
+check("every request was counted", snap["request_count"], 3)
 check("no description yet", snap["description"], None)
-
-frame = FakeFrame("d")
-worker.request(frame, 80.0)
-check("a dropped request does not copy the frame", frame.copies, 0)
+check("the worker starts IDLE", snap["state"], "IDLE")
 
 
 # ==========================================================================
@@ -332,6 +336,7 @@ print("\nGemini worker: failures are absorbed, Phase 1 continues")
 # ==========================================================================
 def failing_worker(exc):
     w = vision.GeminiWorker()
+    w._latest_request_id = 1        # this hand-built request IS the newest
     w._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
 
     def boom(jpeg, distance):
@@ -347,7 +352,7 @@ for label, exc in [
     ("unexpected exception", ValueError("malformed response")),
 ]:
     w = failing_worker(exc)
-    request = vision.AiRequest(FakeFrame(), 80.0, time.monotonic())
+    request = vision.AiRequest(FakeFrame(), 80.0, "CAUTION", time.monotonic(), 1, "band")
     raised = None
     try:
         w._process_request(request)
@@ -360,9 +365,10 @@ for label, exc in [
 
 # An empty reply is a failure, not a description.
 w = vision.GeminiWorker()
+w._latest_request_id = 1
 w._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
 w._call_gemini = lambda jpeg, distance: "   "
-w._process_request(vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
+w._process_request(vision.AiRequest(FakeFrame(), 80.0, "CAUTION", time.monotonic(), 1, "band"))
 check("empty reply is not shown", w.snapshot()["description"], None)
 
 
@@ -370,11 +376,12 @@ check("empty reply is not shown", w.snapshot()["description"], None)
 print("\nGemini worker: stale results are discarded, never displayed")
 # ==========================================================================
 w = vision.GeminiWorker()
+w._latest_request_id = 1
 w._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
 w._call_gemini = lambda jpeg, distance: "Chair directly ahead."
 
 # Fresh reply -> shown.
-w._process_request(vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
+w._process_request(vision.AiRequest(FakeFrame(), 80.0, "CAUTION", time.monotonic(), 1, "band"))
 check("a fresh description is shown",
       w.snapshot()["description"], "Chair directly ahead.")
 check("one reply counted", w.snapshot()["reply_count"], 1)
@@ -387,10 +394,11 @@ check("and is reported as stale", snap["stale"], True)
 
 # A reply whose image was already too old on arrival is never stored.
 w2 = vision.GeminiWorker()
+w2._latest_request_id = 1
 w2._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
 w2._call_gemini = lambda jpeg, distance: "Person ahead."
-old_capture = time.monotonic() - (config.GEMINI_RESULT_MAX_AGE_S + 5)
-w2._process_request(vision.AiRequest(FakeFrame(), 80.0, old_capture))
+old_capture = time.monotonic() - (config.GEMINI_ACCEPT_MAX_AGE_S + 5)
+w2._process_request(vision.AiRequest(FakeFrame(), 80.0, "CAUTION", old_capture, 1, "band"))
 snap = w2.snapshot()
 check("a reply born stale is discarded", snap["description"], None)
 check("and counted as discarded", snap["discarded_count"], 1)
@@ -657,16 +665,343 @@ else:
 # The worker's real entry point must be callable on a STARTED thread - the
 # exact condition the original bug broke.
 _started = vision.GeminiWorker()
+_started._latest_request_id = 1
 _started._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
 _started._call_gemini = lambda jpeg, distance: "Wall ahead."
 _started.start()
 try:
     _started._process_request(
-        vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
+        vision.AiRequest(FakeFrame(), 80.0, "CAUTION", time.monotonic(), 1, "band"))
     check("_process_request works on a running thread",
           _started.snapshot()["description"], "Wall ahead.")
 finally:
     _started.stop()
+
+
+# ==========================================================================
+print("\nHardware configuration is the confirmed wiring")
+# ==========================================================================
+check("TRIG is Robot HAT port D0", config.TRIG_PIN, "D0")
+check("ECHO is Robot HAT port D1", config.ECHO_PIN, "D1")
+check("D0 maps to GPIO17", config.ROBOT_HAT_PIN_TO_BCM["D0"], 17)
+check("D1 maps to GPIO4", config.ROBOT_HAT_PIN_TO_BCM["D1"], 4)
+check("the two ports are different", config.TRIG_PIN != config.ECHO_PIN, True)
+
+# ==========================================================================
+print("\nBand boundaries are unchanged by Phase 3")
+# ==========================================================================
+check("SAFE above 100 cm", config.SAFE_DISTANCE_CM, 100.0)
+check("CAUTION band starts at 50 cm", config.CAUTION_DISTANCE_CM, 50.0)
+check("WARNING band starts at 25 cm", config.WARNING_DISTANCE_CM, 25.0)
+check("only DANGER repeats a beep",
+      [alerts.beep_interval_for(s) is not None
+       for s in ("SAFE", "CAUTION", "WARNING", "DANGER")],
+      [False, False, False, True])
+
+# ==========================================================================
+print("\nAI triggers: band, substantial move, periodic refresh")
+# ==========================================================================
+clock = FakeClock()
+policy = alerts.AlertPolicy(now=clock)
+policy.update(150)
+check("entering CAUTION triggers on the band",
+      policy.update(80).ai_reason, "band")
+
+# Small drift must NOT spend a request.
+clock.advance(config.GEMINI_COOLDOWN_S + 1)
+check("a few cm of jitter does not trigger",
+      policy.update(78).ai_reason, None)
+clock.advance(config.GEMINI_COOLDOWN_S + 1)
+check("still no trigger for small drift",
+      policy.update(72).ai_reason, None)
+
+# A substantial move within the same band does.
+clock.advance(config.GEMINI_COOLDOWN_S + 1)
+reason = policy.update(80 - config.GEMINI_DISTANCE_CHANGE_CM - 1).ai_reason
+check("a substantial distance change triggers",
+      reason is not None and reason.startswith("moved"), True)
+
+# Sitting still eventually earns a refresh, but not before.
+clock2 = FakeClock()
+policy2 = alerts.AlertPolicy(now=clock2)
+policy2.update(150)
+policy2.update(80)                       # "band"
+clock2.advance(config.GEMINI_REFRESH_S - 1)
+check("no refresh before the interval", policy2.update(80).ai_reason, None)
+clock2.advance(2)
+check("refresh once the interval passes",
+      policy2.update(80).ai_reason, "refresh")
+
+# The cooldown still gates everything.
+clock3 = FakeClock()
+policy3 = alerts.AlertPolicy(now=clock3)
+policy3.update(150)
+policy3.update(80)                       # "band"
+clock3.advance(1.0)
+check("cooldown blocks a second request", policy3.update(20).ai_reason, None)
+
+check("moving away never triggers", ai_calls([150, 20, 40, 70, 150]), [20])
+check("staying in SAFE never triggers", ai_calls([200, 150, 300]), [])
+check("DANGER entry still triggers when armed", ai_calls([150, 20]), [20])
+
+
+# ==========================================================================
+print("\nNewest request wins; nothing ever backs up")
+# ==========================================================================
+
+
+class FakeFrame:
+    def __init__(self, tag="f"):
+        self.tag = tag
+        self.copies = 0
+
+    def copy(self):
+        self.copies += 1
+        return self
+
+
+worker = vision.GeminiWorker()          # not started: no thread, no network
+check("first request accepted",
+      worker.request(FakeFrame("a"), 80.0, "CAUTION", "band"), True)
+check("second request also accepted (it replaces the first)",
+      worker.request(FakeFrame("b"), 60.0, "CAUTION", "moved"), True)
+check("third request also accepted",
+      worker.request(FakeFrame("c"), 40.0, "WARNING", "band"), True)
+
+snap = worker.snapshot()
+check("all three counted as requests", snap["request_count"], 3)
+check("two older ones were replaced, not queued", snap["replaced_count"], 2)
+check("the queue still holds exactly one item", worker._queue.qsize(), 1)
+
+queued = worker._queue.get_nowait()
+check("and it is the NEWEST one", queued.distance_cm, 40.0)
+check("which carries its request id", queued.request_id, 3)
+check("and the trigger reason", queued.reason, "band")
+
+# Request ids must be strictly increasing so "newest" is well defined.
+w_ids = vision.GeminiWorker()
+for _ in range(4):
+    w_ids.request(FakeFrame(), 50.0, "WARNING", "band")
+ids = []
+while not w_ids._queue.empty():
+    ids.append(w_ids._queue.get_nowait().request_id)
+check("the surviving request is the highest id", ids, [4])
+
+
+# ==========================================================================
+print("\nRelevance decides acceptance, not a stopwatch")
+# ==========================================================================
+worker = vision.GeminiWorker()
+worker.note_current_state(60.0, "CAUTION")
+worker._latest_request_id = 2
+
+fresh = vision.AiRequest(FakeFrame(), 60.0, "CAUTION", time.monotonic(), 2, "band")
+older = vision.AiRequest(FakeFrame(), 80.0, "CAUTION", time.monotonic(), 1, "band")
+
+check("a matching request is accepted",
+      worker._relevance_problem(fresh, 1.0), None)
+
+# A SLOW but still-true reply must be accepted - this is the whole point.
+check("a 6s-old reply is accepted while the obstacle is unchanged",
+      worker._relevance_problem(fresh, 6.3), None)
+
+reason = worker._relevance_problem(older, 1.0)
+check("a superseded request is rejected",
+      reason is not None and "superseded" in reason, True)
+
+worker.note_current_state(None, "SAFE")
+reason = worker._relevance_problem(fresh, 1.0)
+check("a vanished obstacle rejects the reply",
+      reason is not None and "gone" in reason, True)
+
+worker.note_current_state(None, "UNKNOWN")
+reason = worker._relevance_problem(fresh, 1.0)
+check("a failing sensor rejects the reply",
+      reason is not None and "gone" in reason, True)
+
+worker.note_current_state(60.0 + config.GEMINI_RELEVANCE_DISTANCE_CM + 5, "CAUTION")
+reason = worker._relevance_problem(fresh, 1.0)
+check("a materially changed distance rejects the reply",
+      reason is not None and "scene changed" in reason, True)
+
+worker.note_current_state(60.0 + config.GEMINI_RELEVANCE_DISTANCE_CM - 5, "CAUTION")
+check("a small distance change still accepts",
+      worker._relevance_problem(fresh, 1.0), None)
+
+worker.note_current_state(60.0, "CAUTION")
+reason = worker._relevance_problem(fresh, config.GEMINI_ACCEPT_MAX_AGE_S + 1)
+check("the age backstop still catches a hung socket",
+      reason is not None and "too old" in reason, True)
+
+check("the backstop is more generous than the display window",
+      config.GEMINI_ACCEPT_MAX_AGE_S > config.GEMINI_RESULT_MAX_AGE_S, True)
+
+
+# ==========================================================================
+print("\nEnd to end: accept, then reject an obsolete reply")
+# ==========================================================================
+worker = vision.GeminiWorker()
+worker._encode_jpeg = staticmethod(lambda frame: b"jpeg")
+worker._call_gemini = lambda jpeg, distance: "Chair ahead, move right."
+
+worker.request(FakeFrame(), 60.0, "CAUTION", "band")
+request = worker._queue.get_nowait()
+worker.note_current_state(58.0, "CAUTION")
+worker._process_request(request)
+snap = worker.snapshot()
+check("a relevant reply is published",
+      snap["description"], "Chair ahead, move right.")
+check("its generation bumped", snap["generation"], 1)
+check("timings were recorded", snap["api_ms"] is not None, True)
+check("the band at capture is kept", snap["status"], "CAUTION")
+
+# Now the user walks away while a reply is in flight.
+worker2 = vision.GeminiWorker()
+worker2._encode_jpeg = staticmethod(lambda frame: b"jpeg")
+worker2._call_gemini = lambda jpeg, distance: "Person ahead, left."
+worker2.request(FakeFrame(), 40.0, "WARNING", "band")
+request = worker2._queue.get_nowait()
+worker2.note_current_state(None, "SAFE")        # obstacle gone
+worker2._process_request(request)
+snap = worker2.snapshot()
+check("an obsolete reply is never published", snap["description"], None)
+check("and is counted as discarded", snap["discarded_count"], 1)
+check("not as an error", snap["error_count"], 0)
+check("the HUD is told it was discarded", snap["state"], "DISCARDED")
+
+
+# ==========================================================================
+print("\nThe ultrasonic distance is what reaches Gemini")
+# ==========================================================================
+captured = {}
+
+
+def _spy(jpeg, distance_cm):
+    captured["distance"] = distance_cm
+    captured["prompt"] = config.GEMINI_PROMPT.format(
+        distance_cm=int(distance_cm))
+    return "Table leg ahead, move left."
+
+
+worker = vision.GeminiWorker()
+worker._encode_jpeg = staticmethod(lambda frame: b"jpeg")
+worker._call_gemini = _spy
+worker.request(FakeFrame(), 42.0, "WARNING", "band")
+worker.note_current_state(42.0, "WARNING")
+worker._process_request(worker._queue.get_nowait())
+
+check("the measured distance is passed through", captured["distance"], 42.0)
+check("and appears in the prompt", "42 cm" in captured["prompt"], True)
+check("the prompt forbids the model estimating distance",
+      "do NOT" in config.GEMINI_PROMPT and "estimate" in config.GEMINI_PROMPT,
+      True)
+check("the prompt asks for left/centre/right",
+      "left, centre or right" in config.GEMINI_PROMPT, True)
+check("the prompt forbids inventing a direction",
+      "never invent a direction" in config.GEMINI_PROMPT, True)
+check("the prompt gives the no-information fallback",
+      '"Obstacle ahead."' in config.GEMINI_PROMPT, True)
+check("replies are capped in length",
+      config.GEMINI_MAX_OUTPUT_TOKENS <= 64, True)
+check("frames are downscaled before upload",
+      config.GEMINI_SEND_RESOLUTION[0] < config.CAMERA_RESOLUTION[0], True)
+
+
+# ==========================================================================
+print("\nSpeech: newest wins, no repeats, danger interrupts")
+# ==========================================================================
+
+
+class FakeVoice:
+    """Stands in for espeak; records what was spoken."""
+
+    def __init__(self):
+        self.spoken = []
+        self.stops = 0
+        self._busy_until = 0.0
+
+    def speak(self, text):
+        self.spoken.append(text)
+        self._busy_until = time.monotonic() + 0.05
+        return True
+
+    def is_speaking(self):
+        return time.monotonic() < self._busy_until
+
+    def stop(self):
+        self.stops += 1
+        self._busy_until = 0.0
+
+
+voice = FakeVoice()
+speech_clock = FakeClock()
+talker = SpeechController(voice, now=speech_clock)
+
+check("a phrase is accepted", talker.say("Person ahead, left."), True)
+check("empty text is ignored", talker.say("   "), False)
+check("None is ignored", talker.say(None), False)
+
+talker.start()
+try:
+    time.sleep(0.3)
+    check("the phrase was spoken once", voice.spoken, ["Person ahead, left."])
+
+    # Duplicate suppression.
+    check("the identical phrase is suppressed",
+          talker.say("Person ahead, left."), False)
+    speech_clock.advance(config.SPEECH_DUPLICATE_GAP_S - 1)
+    check("still suppressed inside the gap",
+          talker.say("Person ahead, left."), False)
+    speech_clock.advance(2)
+    check("allowed again once the gap has passed",
+          talker.say("Person ahead, left."), True)
+    time.sleep(0.3)
+    check("so it was spoken twice in total",
+          voice.spoken.count("Person ahead, left."), 2)
+
+    # A different phrase is never suppressed.
+    check("different guidance is always allowed",
+          talker.say("Chair ahead, move right."), True)
+    time.sleep(0.3)
+    check("and is spoken", "Chair ahead, move right." in voice.spoken, True)
+
+    # Danger silences speech and cuts off what is playing.
+    stops_before = voice.stops
+    talker.set_muted(True)
+    check("muting stops the current phrase", voice.stops > stops_before, True)
+    check("muted speech rejects new phrases",
+          talker.say("Doorway right."), False)
+    spoken_before = len(voice.spoken)
+    time.sleep(0.2)
+    check("and nothing new is spoken while muted",
+          len(voice.spoken), spoken_before)
+
+    talker.set_muted(False)
+    check("unmuting accepts phrases again", talker.say("Doorway right."), True)
+    time.sleep(0.3)
+    check("which are then spoken", voice.spoken[-1], "Doorway right.")
+
+    check("suppressions were counted", talker.suppressed_count >= 3, True)
+finally:
+    stop_started = time.perf_counter()
+    talker.stop()
+    stop_took = time.perf_counter() - stop_started
+
+check("speech stop() returns promptly", stop_took < 1.0, True)
+check("the speech thread exited", talker.is_alive(), False)
+
+# Newest-wins at the queue level: two phrases before the thread runs.
+voice2 = FakeVoice()
+talker2 = SpeechController(voice2)
+talker2.say("Old guidance.")
+talker2.say("New guidance.")
+check("only the newest phrase is pending", talker2._pending_text,
+      "New guidance.")
+
+# Truncation keeps assistive audio short.
+check("a long phrase is truncated",
+      len(_clean_for_speech("x" * 500)), config.SPEECH_MAX_CHARS)
+check("danger muting is enabled by default", config.SPEECH_MUTE_IN_DANGER, True)
 
 
 # ==========================================================================

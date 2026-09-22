@@ -254,12 +254,37 @@ ENV_FILE_PATH = PROJECT_ROOT / ".env.local"
 # local tone.
 GEMINI_COOLDOWN_S = 5.0
 
-# --- Staleness -------------------------------------------------------------
-# Age is measured from the moment the IMAGE WAS CAPTURED, not from when the
-# reply arrived. A description older than this is discarded rather than
-# shown, so "Chair ahead." can never appear after the user has walked past
-# the chair.
-GEMINI_RESULT_MAX_AGE_S = 4.0
+# Beyond band changes, two more things are worth a fresh look:
+#
+# 1. The obstacle distance changed substantially - the scene is different
+#    enough that the old description may no longer apply. Must be well
+#    above ultrasonic jitter (a few cm) so noise cannot trigger it.
+GEMINI_DISTANCE_CHANGE_CM = 25.0
+#
+# 2. An obstacle has been sitting there long enough that a refreshed
+#    description is useful (you may have turned your head). Set to 0 to
+#    disable periodic refresh entirely.
+GEMINI_REFRESH_S = 15.0
+
+# --- Relevance, not just age ----------------------------------------------
+# A slow reply is not automatically a WRONG reply. "Chair ahead, move right"
+# that took 6 seconds is still correct if the chair is still 45 cm ahead; it
+# is only wrong if the scene has actually changed. So acceptance is decided
+# by relevance, and age is only the last-resort backstop.
+#
+# A reply is REJECTED if any of these is true:
+#
+#   1. a newer request has since been made          (newest always wins)
+#   2. the obstacle is gone       - status is now SAFE/UNKNOWN
+#   3. the distance moved by more than this much since the image was taken
+GEMINI_RELEVANCE_DISTANCE_CM = 30.0
+#   4. the reply is older than this on arrival - a hung-socket backstop,
+#      deliberately generous because rules 1-3 do the real work
+GEMINI_ACCEPT_MAX_AGE_S = 12.0
+
+# How long an ACCEPTED description stays on the HUD / is considered current.
+# This is a display window only; it no longer gates acceptance.
+GEMINI_RESULT_MAX_AGE_S = 8.0
 
 # --- Timeouts --------------------------------------------------------------
 # Two layers. The SDK timeout asks the HTTP client to give up, and the worker
@@ -284,10 +309,28 @@ GEMINI_REQUEST_TIMEOUT_S = 20.0
 # above would never actually come into play.
 GEMINI_DEADLINE_S = 25.0
 
-# --- Image ---------------------------------------------------------------
-# 640x480 fits inside a single 768x768 tile, which costs 258 image tokens,
-# so there is nothing to gain from downscaling further.
-GEMINI_JPEG_QUALITY = 80
+# --- Image / latency -----------------------------------------------------
+# Token cost is flat: anything up to 768x768 is a single 258-token tile, so
+# 640x480 and 512x384 cost exactly the same to the model. UPLOAD time is not
+# flat though, and on a Pi 3's Wi-Fi the bytes on the wire are a real part of
+# the round trip - so we downscale before encoding. Set to None to send the
+# camera frame at full resolution.
+GEMINI_SEND_RESOLUTION = (512, 384)
+GEMINI_JPEG_QUALITY = 75
+
+# Cap the reply. A six-word navigation phrase needs very few tokens, and an
+# unconstrained model can spend seconds generating prose we then throw away.
+GEMINI_MAX_OUTPUT_TOKENS = 48
+
+# Ask the model not to "think" before answering, where the SDK supports it.
+# Thinking tokens are pure latency for a task this small. Ignored safely if
+# the installed SDK or model does not accept the option.
+GEMINI_DISABLE_THINKING = True
+
+# Make one tiny throwaway call at startup so DNS, TLS and the connection
+# pool are already warm when the first real obstacle appears. Costs about
+# $0.00001 and removes handshake time from the first useful request.
+GEMINI_PREWARM = True
 
 # --- Output ----------------------------------------------------------------
 GEMINI_MAX_DESCRIPTION_CHARS = 60
@@ -296,18 +339,61 @@ GEMINI_MAX_DESCRIPTION_CHARS = 60
 # flapping network from filling the terminal.
 GEMINI_ERROR_REPEAT_S = 30.0
 
-# The prompt. {distance_cm} is filled in with the measured distance.
+# The prompt. {distance_cm} is filled in from the ULTRASONIC reading, so the
+# model never has to guess distance - it only has to identify what the thing
+# is and where it sits in the frame.
 GEMINI_PROMPT = (
-    "You are the vision system of a navigation aid for a blind user. "
-    "An obstacle was detected about {distance_cm} cm ahead.\n\n"
-    "Reply with ONE short phrase of at most six words naming the most "
-    "important navigation obstacle or hazard directly ahead.\n\n"
-    "Prioritise: people, chairs, tables, walls, doors, stairs, curbs, "
+    "You are the vision system of a navigation aid for a blind user.\n\n"
+    "An obstacle was detected approximately {distance_cm} cm directly ahead. "
+    "That distance is measured by an ultrasonic sensor and is accurate - do "
+    "NOT estimate or mention distance yourself.\n\n"
+    "Analyse this camera frame for navigation. Identify the important "
+    "obstacle and its position in the frame as left, centre or right. If the "
+    "image clearly supports it, add a short safe movement suggestion.\n\n"
+    "Reply with ONE phrase of at most six words. No distance, no commentary, "
+    "no explanation.\n\n"
+    "Prioritise: people, chairs, tables, walls, doorways, stairs, curbs, "
     "poles, vehicles, pathways, and immediate trip or collision hazards.\n\n"
+    'Good replies: "Person ahead, slightly left." "Chair ahead, move right." '
+    '"Doorway ahead on the right." "Table leg ahead, move left." '
+    '"Wall ahead, move left."\n\n'
+    "CRITICAL: never invent a direction. If the frame does not clearly show "
+    "which way is safe, or the obstacle fills the view, reply exactly: "
+    '"Obstacle ahead."\n\n'
     "Do not identify who anyone is. Do not describe appearance, clothing, "
-    "age, gender, race or any other personal characteristic. Do not add "
-    "commentary, explanation or punctuation beyond a final full stop.\n\n"
-    'Examples: "Person ahead." "Two people ahead." "Chair directly ahead." '
-    '"Closed door ahead." "Stairs descending ahead." "Wall ahead."\n\n'
+    "age, gender, race or any other personal characteristic.\n\n"
     'If there is no meaningful navigation obstacle, reply exactly: "Path clear."'
 )
+
+
+# ==========================================================================
+# 7. SPOKEN NAVIGATION  (Phase 3)
+# ==========================================================================
+# Accepted Gemini guidance is spoken through the same headphones as the
+# beeps, using a local offline text-to-speech engine. No network, no cloud
+# TTS, nothing added to the Gemini round trip.
+#
+# The beep system is completely untouched by this. Speech runs on its own
+# thread so a 2-second phrase can never delay a danger beep.
+
+SPEECH_ENABLED = True
+
+# Words per minute. Assistive speech wants to be brisk but intelligible;
+# espeak's default 175 is a reasonable middle.
+SPEECH_RATE_WPM = 170
+
+# espeak amplitude, 0-200. 100 is its default.
+SPEECH_VOLUME = 110
+
+# Do not repeat identical guidance within this many seconds. Stops "Person
+# ahead, left." being spoken over and over while you stand in a doorway.
+SPEECH_DUPLICATE_GAP_S = 12.0
+
+# SAFETY: while the distance is in the DANGER band, speech is silenced and
+# any phrase already being spoken is cut off, so the rapid danger beeps are
+# never competing with a sentence. Leave this True.
+SPEECH_MUTE_IN_DANGER = True
+
+# Longest phrase we will speak. Anything longer is truncated - assistive
+# audio must stay short.
+SPEECH_MAX_CHARS = 60

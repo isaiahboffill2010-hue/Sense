@@ -81,7 +81,7 @@ SEVERITY = {UNKNOWN: -1, SAFE: 0, CAUTION: 1, WARNING: 2, DANGER: 3}
 # What AlertPolicy.update() hands back to the main loop.
 AlertDecision = collections.namedtuple(
     "AlertDecision",
-    ["status", "repeat_interval", "play_warning_tone", "request_ai"],
+    ["status", "repeat_interval", "play_warning_tone", "request_ai", "ai_reason"],
 )
 
 
@@ -129,6 +129,7 @@ class AlertPolicy:
         self._status = UNKNOWN
         self._last_warning_tone_at = None
         self._last_ai_request_at = None
+        self._last_ai_distance_cm = None
         # Injectable clock so tests do not have to sleep in real time.
         self._now = now or time.monotonic
 
@@ -150,15 +151,17 @@ class AlertPolicy:
         if play_tone:
             self._last_warning_tone_at = self._now()
 
-        request_ai = self._should_request_ai(status, previous)
-        if request_ai:
+        ai_reason = self._ai_reason(status, previous, distance_cm)
+        if ai_reason:
             self._last_ai_request_at = self._now()
+            self._last_ai_distance_cm = distance_cm
 
         return AlertDecision(
             status=status,
             repeat_interval=beep_interval_for(status),
             play_warning_tone=play_tone,
-            request_ai=request_ai,
+            request_ai=bool(ai_reason),
+            ai_reason=ai_reason,
         )
 
     def _warning_tone_is_armed(self):
@@ -175,32 +178,55 @@ class AlertPolicy:
         return (self._now() - self._last_warning_tone_at) >= gap
 
     # ---------------------------------------------------------- AI trigger
-    def _should_request_ai(self, status, previous):
-        """True when a fresh Gemini look is warranted.
+    def _ai_reason(self, status, previous, distance_cm):
+        """Why a fresh Gemini look is warranted, or None to stay quiet.
 
-        The rule is "an obstacle just moved into a CLOSER band": any step up
-        in severity into CAUTION, WARNING or DANGER asks for one analysis.
+        Returns a short reason string rather than a bare bool, so the
+        terminal log and the tests can tell the three triggers apart.
 
-        Driving it off severity rather than naming one band matters, because
-        readings arrive roughly every 90 ms and a walking pace covers about
-        13 cm in that time - so a fast approach, or simply turning your head,
-        can jump SAFE -> WARNING or SAFE -> DANGER and skip a band entirely.
-        Keying on any increase means those cases still get analysed.
+        There are three, all gated by the same single global cooldown:
 
-        In the ordinary SAFE -> CAUTION -> WARNING -> DANGER walk-up, only
-        the CAUTION entry actually reaches the API: the later steps follow
-        within a second or two and the global cooldown absorbs them. That is
-        the intended behaviour - CAUTION is where the camera framing is best
-        and where there is the most time for a reply to come back.
+        "band"      An obstacle moved into a CLOSER band. Driving this off
+                    severity rather than naming one band matters: readings
+                    arrive every ~90 ms and walking pace covers ~13 cm in
+                    that time, so a fast approach - or just turning your
+                    head - can jump SAFE -> WARNING or SAFE -> DANGER and
+                    skip a band entirely. Keying on any increase catches
+                    those. In an ordinary walk-up only the first entry
+                    reaches the API; the cooldown absorbs the rest.
 
-        Moving AWAY never asks: backing out of DANGER into WARNING is a
-        decrease in severity, so it returns False.
+        "moved"     The distance changed substantially without changing
+                    band. The threshold is far above ultrasonic jitter, so
+                    noise cannot trigger it, but walking from 95 cm to 60 cm
+                    is a genuinely different scene.
+
+        "refresh"   An obstacle has persisted long enough that the old
+                    description may no longer reflect where you are looking.
+
+        Moving AWAY never asks on its own: backing out of DANGER into
+        WARNING is a decrease in severity.
         """
         if status not in (CAUTION, WARNING, DANGER):
-            return False
-        if SEVERITY[status] <= SEVERITY[previous]:
-            return False
-        return self._ai_is_armed()
+            return None
+        if not self._ai_is_armed():
+            return None
+
+        if SEVERITY[status] > SEVERITY[previous]:
+            return "band"
+
+        # From here on the band is unchanged (or improved but still a
+        # tracked band), so only a real change of scene justifies a request.
+        if distance_cm is not None and self._last_ai_distance_cm is not None:
+            moved = abs(distance_cm - self._last_ai_distance_cm)
+            if moved >= config.GEMINI_DISTANCE_CHANGE_CM:
+                return "moved {:.0f}cm".format(moved)
+
+        refresh = config.GEMINI_REFRESH_S
+        if refresh > 0 and self._last_ai_request_at is not None:
+            if (self._now() - self._last_ai_request_at) >= refresh:
+                return "refresh"
+
+        return None
 
     def _ai_is_armed(self):
         """False while the global Gemini cooldown is still running.

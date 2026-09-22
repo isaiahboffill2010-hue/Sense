@@ -58,6 +58,13 @@ GREY = (170, 170, 170)
 WHITE = (255, 255, 255)
 CYAN = (255, 255, 120)      # the Gemini description line
 
+# Colours for the AI activity line.
+AI_STATE_COLORS = {
+    "IDLE": GREY,
+    "THINKING": (255, 200, 80),     # amber: a request is in flight
+    "DISCARDED": (150, 150, 255),   # pink: a reply was rejected as obsolete
+}
+
 STATE_COLORS = {
     STATUS_OK: GREEN,
     STATUS_FAIL: RED,
@@ -92,6 +99,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--skip-gemini", action="store_true",
         help="do not start Gemini vision (the rest still works normally)"
+    )
+    parser.add_argument(
+        "--skip-speech", action="store_true",
+        help="do not speak AI guidance; beeps and the HUD are unaffected"
     )
     parser.add_argument(
         "--force",
@@ -145,12 +156,20 @@ def format_distance(snapshot):
     return "Distance: {:.0f} cm".format(distance)
 
 
-def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None):
+def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None,
+                       speech=None):
     """Feed the latest reading to the alert policy and act on its decision.
 
     Returns the status word to display. This is the single place where the
     device decides whether to make a sound or ask Gemini, so the overlay,
     the audio and the AI can never disagree about what band we are in.
+
+    Ordering here is the safety priority, top to bottom:
+
+      1. the local beeps are driven FIRST, straight from the ultrasonic
+         reading, and never wait on anything
+      2. DANGER silences speech, cutting off any phrase mid-word
+      3. only then is Gemini given a frame, via a call that cannot block
 
     IMPORTANT: the caller must invoke this BEFORE ui.draw_hud(), because
     draw_hud mutates the frame in place. Queueing afterwards would send
@@ -159,6 +178,7 @@ def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None):
     distance = snapshot["distance_cm"] if snapshot is not None else None
     decision = policy.update(distance)
 
+    # --- 1. immediate collision warning, always first ---------------------
     if beeper is not None:
         # Repeated beeps: only DANGER sets a non-None interval.
         beeper.set_interval(decision.repeat_interval)
@@ -166,12 +186,41 @@ def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None):
         if decision.play_warning_tone:
             beeper.play_once(TONE_WARNING)
 
-    # Gemini never gates the beeps above - it is asked afterwards, and the
-    # request itself is a bounded put_nowait that cannot block.
-    if decision.request_ai and vision is not None and frame is not None:
-        vision.request(frame, distance)
+    # --- 2. danger outranks speech ----------------------------------------
+    if speech is not None and config.SPEECH_MUTE_IN_DANGER:
+        speech.set_muted(decision.status == alerts.DANGER)
+
+    # --- 3. supplemental scene understanding ------------------------------
+    if vision is not None:
+        # Keep the worker's idea of "now" fresh so a finished reply can be
+        # judged against the current world rather than a stopwatch.
+        vision.note_current_state(distance, decision.status)
+
+        if decision.request_ai and frame is not None:
+            vision.request(frame, distance, decision.status, decision.ai_reason)
 
     return decision.status
+
+
+def speak_new_guidance(vision, speech, spoken_generation):
+    """Speak an accepted description once. Returns the generation spoken.
+
+    The worker bumps `generation` only when a result passes the relevance
+    check, so comparing generations is what stops the same guidance being
+    spoken again on every frame. SpeechController adds its own duplicate
+    suppression on top, for the case where two separate requests happen to
+    come back with identical wording.
+    """
+    if vision is None or speech is None:
+        return spoken_generation
+
+    ai = vision.snapshot()
+    generation = ai["generation"]
+    if generation == spoken_generation or not ai["description"]:
+        return spoken_generation
+
+    speech.say(ai["description"])
+    return generation
 
 
 def build_hud_lines(snapshot, status, states, audio_error, ai=None):
@@ -186,11 +235,16 @@ def build_hud_lines(snapshot, status, states, audio_error, ai=None):
     if ai is not None and ai["description"]:
         lines.append(("AI: " + _shorten(ai["description"], 44), CYAN))
 
-    for label in ("Camera", "Ultrasonic", "Audio", "Gemini"):
+    for label in ("Camera", "Ultrasonic", "Audio", "Gemini", "Speech"):
         state, _detail = states[label]
         lines.append(
             ("{}: {}".format(label, state), STATE_COLORS.get(state, GREY))
         )
+
+    # What the AI worker is doing right now, and how fast it was last time.
+    if ai is not None:
+        lines.append((_ai_activity_line(ai), AI_STATE_COLORS.get(
+            ai["state"], GREY)))
 
     # Show live failures underneath, so a mid-run problem is visible on screen.
     if snapshot is not None and snapshot["error"]:
@@ -201,6 +255,23 @@ def build_hud_lines(snapshot, status, states, audio_error, ai=None):
         lines.append(("GEMINI: " + _shorten(ai["error"]), RED))
 
     return lines
+
+
+def _ai_activity_line(ai):
+    """One compact debug line: worker state, last latency, rejection counts."""
+    parts = ["AI " + ai["state"]]
+
+    if ai["api_ms"] is not None:
+        parts.append("{:.1f}s".format(ai["api_ms"] / 1000.0))
+
+    parts.append("req {} ok {} rej {}".format(
+        ai["request_count"], ai["reply_count"],
+        ai["replaced_count"] + ai["discarded_count"]))
+
+    line = "  ".join(parts)
+    if ai["state"] == "DISCARDED" and ai["discard_reason"]:
+        line += " - " + _shorten(ai["discard_reason"], 30)
+    return line
 
 
 def _shorten(text, limit=48):
@@ -319,6 +390,39 @@ def start_vision(args, states):
     return worker
 
 
+def start_speech(args, states):
+    """Open offline text-to-speech. Returns (player, controller) or (None, None).
+
+    Never fatal: if there is no TTS engine installed, the beeps, the HUD and
+    everything else carry on exactly as before.
+    """
+    if args.skip_speech or not config.SPEECH_ENABLED:
+        reason = "--skip-speech" if args.skip_speech else "SPEECH_ENABLED=False"
+        states["Speech"] = (STATUS_SKIPPED, reason)
+        print("Speech: SKIPPED ({})".format(reason))
+        return None, None
+
+    print("Speech: checking...", flush=True)
+    from hardware.audio import AudioError, SpeechController, SpeechPlayer
+
+    try:
+        player = SpeechPlayer().open()
+    except AudioError as exc:
+        states["Speech"] = (STATUS_FAIL, str(exc))
+        print("SPEECH ERROR: {}".format(exc))
+        return None, None
+
+    controller = SpeechController(player)
+    controller.start()
+    states["Speech"] = (STATUS_OK, player.description)
+    print("Speech: OK - {}".format(player.description))
+
+    # Say one phrase so you can confirm TTS really reaches the headphones.
+    controller.say("Sense ready.")
+    print("       a spoken test phrase was sent - did you hear it?")
+    return player, controller
+
+
 def start_ultrasonic(args, states):
     """Open the Robot HAT ultrasonic module and start its monitor thread.
 
@@ -388,7 +492,8 @@ def update_states_from_monitor(states, monitor):
         states["Ultrasonic"] = (STATUS_OK, "recovered")
 
 
-def run_preview_loop(camera, monitor, beeper, states, policy, vision=None):
+def run_preview_loop(camera, monitor, beeper, states, policy, vision=None,
+                     speech=None):
     """Live OpenCV preview. Returns True if it ran, False to fall back."""
     import cv2
 
@@ -410,6 +515,7 @@ def run_preview_loop(camera, monitor, beeper, states, policy, vision=None):
     print("")
 
     fps = FpsMeter()
+    spoken_generation = 0
     while True:
         try:
             frame = camera.read()
@@ -423,8 +529,10 @@ def run_preview_loop(camera, monitor, beeper, states, policy, vision=None):
 
         # Must run BEFORE draw_hud: it may hand a copy of this still-clean
         # frame to the Gemini worker, and draw_hud mutates the frame.
-        status = apply_alert_policy(policy, snapshot, beeper, frame, vision)
+        status = apply_alert_policy(
+            policy, snapshot, beeper, frame, vision, speech)
         update_states_from_monitor(states, monitor)
+        spoken_generation = speak_new_guidance(vision, speech, spoken_generation)
 
         audio_error = beeper.error if beeper is not None else None
         ai = vision.snapshot() if vision is not None else None
@@ -457,7 +565,8 @@ def run_preview_loop(camera, monitor, beeper, states, policy, vision=None):
     return True
 
 
-def run_headless_loop(camera, monitor, beeper, states, policy, vision=None):
+def run_headless_loop(camera, monitor, beeper, states, policy, vision=None,
+                      speech=None):
     """No window: print the same information to the terminal."""
     print("")
     print("Headless mode. Press Ctrl+C to quit.")
@@ -466,6 +575,7 @@ def run_headless_loop(camera, monitor, beeper, states, policy, vision=None):
     camera_error_reported = False
     fps = FpsMeter()
     next_print = 0.0
+    spoken_generation = 0
 
     while True:
         frame = None
@@ -482,8 +592,10 @@ def run_headless_loop(camera, monitor, beeper, states, policy, vision=None):
                     states["Camera"] = (STATUS_FAIL, str(exc))
 
         snapshot = monitor.snapshot() if monitor is not None else None
-        status = apply_alert_policy(policy, snapshot, beeper, frame, vision)
+        status = apply_alert_policy(
+            policy, snapshot, beeper, frame, vision, speech)
         update_states_from_monitor(states, monitor)
+        spoken_generation = speak_new_guidance(vision, speech, spoken_generation)
 
         now = time.monotonic()
         if now >= next_print:
@@ -499,8 +611,8 @@ def run_headless_loop(camera, monitor, beeper, states, policy, vision=None):
             ))
             if vision is not None:
                 ai = vision.snapshot()
-                if ai["description"]:
-                    print("   AI: {}".format(ai["description"]))
+                if ai["state"] != "IDLE" or ai["description"]:
+                    print("   {}".format(_ai_activity_line(ai)))
             if snapshot is not None and snapshot["error"]:
                 print("   ULTRASONIC ERROR: {}".format(snapshot["error"]))
             if beeper is not None and beeper.error:
@@ -522,7 +634,8 @@ def _short_state(state):
 # ==========================================================================
 # Shutdown
 # ==========================================================================
-def shutdown(camera, sensor, monitor, player, beeper, vision=None):
+def shutdown(camera, sensor, monitor, player, beeper, vision=None,
+             speech=None, speech_player=None):
     """Stop everything, in the safe order, and never raise while doing it."""
     print("")
     print("Cleaning up...")
@@ -530,6 +643,15 @@ def shutdown(camera, sensor, monitor, player, beeper, vision=None):
     if beeper is not None:
         beeper.stop()
         print("  beeper thread stopped")
+
+    if speech is not None:
+        # Cuts off any phrase in progress rather than waiting it out.
+        speech.stop()
+        print("  speech thread stopped")
+
+    if speech_player is not None:
+        speech_player.close()
+        print("  speech engine closed")
 
     if vision is not None:
         # Stopped early so it makes no further network calls. A request
@@ -588,6 +710,7 @@ def main(argv=None):
         "Ultrasonic": (STATUS_SKIPPED, ""),
         "Audio": (STATUS_SKIPPED, ""),
         "Gemini": (STATUS_SKIPPED, ""),
+        "Speech": (STATUS_SKIPPED, ""),
     }
 
     camera = None
@@ -596,6 +719,8 @@ def main(argv=None):
     player = None
     beeper = None
     vision = None
+    speech = None
+    speech_player = None
     exit_code = 0
 
     try:
@@ -616,11 +741,14 @@ def main(argv=None):
         else:
             vision = start_vision(args, states)
 
+        speech_player, speech = start_speech(args, states)
+
         print("-" * 62)
         print("Camera     : {}".format(states["Camera"][0]))
         print("Ultrasonic : {}".format(states["Ultrasonic"][0]))
         print("Audio      : {}".format(states["Audio"][0]))
         print("Gemini     : {}".format(states["Gemini"][0]))
+        print("Speech     : {}".format(states["Speech"][0]))
         print("-" * 62)
 
         if all(state == STATUS_FAIL for state, _ in states.values()):
@@ -640,16 +768,18 @@ def main(argv=None):
         ran_preview = False
         if camera is not None and not args.headless:
             ran_preview = run_preview_loop(
-                camera, monitor, beeper, states, policy, vision
+                camera, monitor, beeper, states, policy, vision, speech
             )
         if not ran_preview:
-            run_headless_loop(camera, monitor, beeper, states, policy, vision)
+            run_headless_loop(
+                camera, monitor, beeper, states, policy, vision, speech)
 
     except KeyboardInterrupt:
         print("")
         print("Ctrl+C received - shutting down...")
     finally:
-        shutdown(camera, sensor, monitor, player, beeper, vision)
+        shutdown(camera, sensor, monitor, player, beeper, vision,
+                 speech, speech_player)
 
     return exit_code
 
