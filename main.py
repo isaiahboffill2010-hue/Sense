@@ -332,6 +332,8 @@ def start_audio(args, states):
 
     states["Audio"] = (STATUS_OK, player.description)
     print("Audio: OK - {}".format(player.description))
+    print("       device: {}".format(
+        config.AUDIO_DEVICE or "system default"))
     print("       beep file: {}".format(player.wav_path))
 
     if config.PLAY_STARTUP_TEST_BEEP:
@@ -416,10 +418,13 @@ def start_speech(args, states):
     controller.start()
     states["Speech"] = (STATUS_OK, player.description)
     print("Speech: OK - {}".format(player.description))
-
-    # Say one phrase so you can confirm TTS really reaches the headphones.
-    controller.say("Sense ready.")
-    print("       a spoken test phrase was sent - did you hear it?")
+    print("       device: {}".format(
+        config.AUDIO_DEVICE or "system default"))
+    # open() already spoke the startup phrase, synchronously, and checked
+    # the exit codes - so reaching here means audio really played on that
+    # device. Saying it again here would just duplicate it.
+    print('       spoke "{}" on that device - did you hear it in the '
+          'headphones?'.format(config.SPEECH_STARTUP_PHRASE))
     return player, controller
 
 
@@ -701,6 +706,11 @@ def main(argv=None):
         diagnostics.print_wrong_os_warning(info)
         if not args.force:
             return 2
+
+    # Printed before anything opens an audio device, so there is never any
+    # doubt about which output the beeps and speech are actually using.
+    print("Audio device      : {}".format(
+        config.AUDIO_DEVICE or "system default (AUDIO_DEVICE not set)"))
 
     print("")
     print("-" * 62)

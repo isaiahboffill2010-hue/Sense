@@ -29,6 +29,7 @@ import time
 import alerts
 import config
 import vision
+import hardware.audio as audio_module
 from hardware.audio import (
     TONE_DANGER,
     TONE_WARNING,
@@ -1177,6 +1178,171 @@ worker = vision.GeminiWorker()
 worker._gen_config_note = "max_tokens only"
 check("with no thinking option attached there is nothing to drop",
       worker._retry_without_thinking(rejection), False)
+
+
+# ==========================================================================
+print("\nAUDIO_DEVICE actually reaches every playback path")
+# ==========================================================================
+# This section exists because of a real bug. config.AUDIO_DEVICE was a
+# hardcoded None and the environment was never consulted, so
+#
+#     export AUDIO_DEVICE=plughw:1,0
+#
+# had NO effect - every guard was `if config.AUDIO_DEVICE:` and every one
+# was False, so beeps and speech both went to the system default (HDMI)
+# while startup cheerfully reported "Audio: OK / Speech: OK".
+
+import importlib
+import subprocess as _subprocess
+
+_saved_env = os.environ.get("AUDIO_DEVICE")
+try:
+    os.environ["AUDIO_DEVICE"] = "plughw:1,0"
+    _reloaded = importlib.reload(config)
+    check("an exported AUDIO_DEVICE reaches config",
+          _reloaded.AUDIO_DEVICE, "plughw:1,0")
+
+    os.environ["AUDIO_DEVICE"] = "   "
+    _reloaded = importlib.reload(config)
+    check("a whitespace-only value is treated as unset",
+          _reloaded.AUDIO_DEVICE, None)
+
+    os.environ.pop("AUDIO_DEVICE", None)
+    _reloaded = importlib.reload(config)
+    check("with nothing exported it is None", _reloaded.AUDIO_DEVICE, None)
+finally:
+    if _saved_env is None:
+        os.environ.pop("AUDIO_DEVICE", None)
+    else:
+        os.environ["AUDIO_DEVICE"] = _saved_env
+    importlib.reload(config)
+    importlib.reload(audio_module)
+
+
+# --- the exact commands built for each path ------------------------------
+_recorded = []
+
+
+class _FakePipe:
+    def close(self):
+        pass
+
+
+class _FakePopen:
+    def __init__(self, args, **kwargs):
+        _recorded.append(list(args))
+        self.args = args
+        self.returncode = 0
+        self.stdout = _FakePipe()
+
+    def communicate(self, timeout=None):
+        return (b"", b"")
+
+    def poll(self):
+        return 0
+
+    def terminate(self):
+        pass
+
+
+class _FakeCompleted:
+    returncode = 0
+    stdout = b"espeak-ng text-to-speech: 1.51"
+    stderr = b""
+
+
+_real_popen = _subprocess.Popen
+_real_run = _subprocess.run
+_saved_device = config.AUDIO_DEVICE
+try:
+    _subprocess.Popen = _FakePopen
+    _subprocess.run = lambda a, **k: _FakeCompleted()
+
+    # ---- device pinned ----
+    config.AUDIO_DEVICE = "plughw:1,0"
+    speaker = audio_module.SpeechPlayer().open()
+    _recorded.clear()
+    speaker.speak("Person ahead, slightly left.")
+    pipeline = " | ".join(" ".join(str(x) for x in c) for c in _recorded)
+
+    check("speech asks espeak for WAV on stdout", "--stdout" in pipeline, True)
+    check("speech pipes it through aplay", "aplay" in pipeline, True)
+    check("speech passes -D to aplay", "-D" in pipeline, True)
+    check("speech uses the configured device",
+          "plughw:1,0" in pipeline, True)
+    check("which matches the known-good shell command",
+          pipeline.startswith("espeak-ng --stdout")
+          and pipeline.endswith("aplay -q -D plughw:1,0"), True)
+
+    _recorded.clear()
+    beeps = audio_module._AplayBackend(
+        {audio_module.TONE_DANGER: "/tmp/b.wav",
+         audio_module.TONE_WARNING: "/tmp/w.wav"})
+    beeps.play(audio_module.TONE_DANGER)
+    check("beeps are pinned to the same device",
+          any("-D" in c and "plughw:1,0" in c for c in _recorded), True)
+
+    # aplay's -D is explicit; SDL only has an AUDIODEV hint, so when the
+    # user has named a device aplay must be tried FIRST for beeps.
+    order = ((audio_module._AplayBackend, audio_module._PygameBackend)
+             if config.AUDIO_DEVICE
+             else (audio_module._PygameBackend, audio_module._AplayBackend))
+    check("aplay is preferred for beeps when a device is pinned",
+          order[0] is audio_module._AplayBackend, True)
+
+    # ---- no device pinned ----
+    config.AUDIO_DEVICE = None
+    plain = audio_module.SpeechPlayer().open()
+    _recorded.clear()
+    plain.speak("Chair ahead.")
+    check("without a device, speech does not need aplay",
+          any("aplay" in c[0] for c in _recorded), False)
+    order = ((audio_module._AplayBackend, audio_module._PygameBackend)
+             if config.AUDIO_DEVICE
+             else (audio_module._PygameBackend, audio_module._AplayBackend))
+    check("and pygame stays preferred for beeps",
+          order[0] is audio_module._PygameBackend, True)
+
+    # ---- a bad device must FAIL startup, not report OK ----
+    class _BadAplay:
+        def __init__(self, args, **kwargs):
+            self.args = args
+            self._is_aplay = "aplay" in args[0]
+            self.returncode = 1 if self._is_aplay else 0
+            self.stdout = _FakePipe()
+
+        def communicate(self, timeout=None):
+            if self._is_aplay:
+                return (b"", b"aplay: audio open error: No such device")
+            return (b"", b"")
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+    config.AUDIO_DEVICE = "plughw:99,0"
+    _subprocess.Popen = _BadAplay
+    raised = None
+    try:
+        audio_module.SpeechPlayer().open()
+    except audio_module.AudioError as exc:
+        raised = exc
+    check("a device that cannot play makes Speech FAIL", raised is not None, True)
+    check("and the error names the device",
+          "plughw:99,0" in str(raised or ""), True)
+    check("and quotes the real aplay error",
+          "No such device" in str(raised or ""), True)
+    check("and says it is an output problem, not a TTS problem",
+          "OUTPUT problem" in str(raised or ""), True)
+finally:
+    _subprocess.Popen = _real_popen
+    _subprocess.run = _real_run
+    config.AUDIO_DEVICE = _saved_device
+
+check("a startup phrase is configured for the playback test",
+      bool(config.SPEECH_STARTUP_PHRASE), True)
 
 
 # ==========================================================================

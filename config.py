@@ -24,6 +24,7 @@ not to a physical 1-40 header position:
 Run `pinout` on the Raspberry Pi to see the full map for your board.
 """
 
+import os
 from pathlib import Path
 
 # Absolute path to this project folder (used for the generated beep file).
@@ -220,8 +221,26 @@ PLAY_STARTUP_TEST_BEEP = True
 # Typical value for the Pi's own analogue jack:
 #
 #     AUDIO_DEVICE = "plughw:CARD=Headphones,DEV=0"
+#     AUDIO_DEVICE = "plughw:1,0"
+#
+# It can also be set from the shell, which is usually easier while you are
+# still working out which device is which:
+#
+#     export AUDIO_DEVICE=plughw:1,0
+#     python3 main.py
+#
+# The environment is read HERE, at import time, and is the default for the
+# value below. That matters: previously this was a hardcoded None and the
+# environment was ignored entirely, so `export AUDIO_DEVICE=...` had no
+# effect and every sound went to the system default output.
+#
+# Note that an export is needed - putting AUDIO_DEVICE in .env.local is too
+# late, because .env.local is only read once the Gemini worker starts, well
+# after this module has been imported and the audio devices opened.
+#
+# Find the exact name with:   aplay -l    and    aplay -L
 
-AUDIO_DEVICE = None
+AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "").strip() or None
 
 
 # ==========================================================================
@@ -415,3 +434,7 @@ SPEECH_MUTE_IN_DANGER = True
 # Longest phrase we will speak. Anything longer is truncated - assistive
 # audio must stay short.
 SPEECH_MAX_CHARS = 60
+
+# Spoken once at startup, as the real playback test. If you do not hear
+# this in your headphones, the routing is wrong and startup will say so.
+SPEECH_STARTUP_PHRASE = "Sense ready."

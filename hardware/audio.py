@@ -8,9 +8,14 @@ internet.
 
 Note on the Robot HAT: the HAT has its own onboard MONO I2S speaker but no
 headphone socket, so the headphones stay in the Pi's jack. If SunFounder's
-i2samp.sh has made the HAT speaker the default ALSA output, set
-AUDIO_DEVICE in config.py to force the beeps back to the headphones - both
-backends below honour it.
+i2samp.sh has made the HAT speaker the default ALSA output, pin the output
+explicitly:
+
+    export AUDIO_DEVICE=plughw:1,0        # or set it in config.py
+
+Every path here honours it - beeps and speech - and when it is set the
+aplay backend is preferred for beeps too, because "aplay -D" is an explicit
+device selection whereas SDL only has the AUDIODEV hint.
 
 Two tones, generated locally with the standard library:
 
@@ -311,8 +316,24 @@ class BeepPlayer:
         self.tone_paths = generate_all_tones()
         self.wav_path = self.tone_paths[TONE_DANGER]
 
+        # Backend order depends on whether a device has been pinned.
+        #
+        # aplay takes "-D <device>", which is an explicit, documented,
+        # testable way to choose the output. SDL/pygame has no device
+        # argument at all - the best we can do is set AUDIODEV and hope its
+        # ALSA backend honours it, which is not guaranteed and is exactly
+        # how beeps ended up on HDMI while AUDIO_DEVICE was set.
+        #
+        # So when the user has named a device, correct routing matters more
+        # than pygame's slightly lower per-beep latency, and aplay goes
+        # first. With no device pinned, pygame is still preferred.
+        if config.AUDIO_DEVICE:
+            order = (_AplayBackend, _PygameBackend)
+        else:
+            order = (_PygameBackend, _AplayBackend)
+
         problems = []
-        for factory in (_PygameBackend, _AplayBackend):
+        for factory in order:
             try:
                 self._backend = factory(self.tone_paths)
             except ImportError as exc:
@@ -539,6 +560,18 @@ class SpeechPlayer:
             )
             if command == "pico2wave":
                 self._wav_path = str(config.PROJECT_ROOT / "assets" / "speech.wav")
+
+            # Finding the binary proves nothing about whether sound reaches
+            # the headphones. Speak one phrase for real, synchronously, and
+            # check the exit codes - so "Speech: OK" means audio actually
+            # played on the selected device.
+            #
+            # A failure here is deliberately NOT retried with the next
+            # engine. The engine clearly exists, so a playback failure is an
+            # output-routing problem, and every other engine would fail on
+            # the same device. Falling through would only bury the useful
+            # error under "no TTS engine found".
+            self._verify_playback()
             return self
 
         raise AudioError(
@@ -547,6 +580,85 @@ class SpeechPlayer:
             + "\n  Install one with:  sudo apt install -y espeak-ng"
             "\n  Beeps and everything else keep working without it."
         )
+
+    def _verify_playback(self):
+        """Speak one short phrase now, and fail loudly if it did not play.
+
+        This is the equivalent of the known-good shell command:
+
+            espeak-ng --stdout "..." | aplay -D plughw:1,0
+
+        run synchronously so a bad device name surfaces at startup instead
+        of silently producing no sound for the whole session.
+        """
+        phrase = _clean_for_speech(config.SPEECH_STARTUP_PHRASE)
+        device = config.AUDIO_DEVICE
+
+        if self._command == "pico2wave":
+            steps = [([self._command, "-w", self._wav_path, phrase], None)]
+            play = ["aplay", "-q"]
+            if device:
+                play += ["-D", device]
+            steps.append((play + [self._wav_path], None))
+        elif device:
+            # Two processes joined by a pipe, exactly like the shell command.
+            steps = [(
+                [self._command, "--stdout",
+                 "-s", str(int(config.SPEECH_RATE_WPM)),
+                 "-a", str(int(config.SPEECH_VOLUME)), phrase],
+                ["aplay", "-q", "-D", device],
+            )]
+        else:
+            steps = [([self._command,
+                       "-s", str(int(config.SPEECH_RATE_WPM)),
+                       "-a", str(int(config.SPEECH_VOLUME)), phrase], None)]
+
+        for produce, consume in steps:
+            self._run_checked(produce, consume)
+
+    @staticmethod
+    def _run_checked(produce, consume):
+        """Run one command, or a two-command pipe, and raise on failure."""
+        try:
+            if consume is None:
+                result = subprocess.run(
+                    produce, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, timeout=20)
+                failures = [(produce[0], result.returncode, result.stderr)]
+            else:
+                first = subprocess.Popen(
+                    produce, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                second = subprocess.Popen(
+                    consume, stdin=first.stdout,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                first.stdout.close()
+                second_err = second.communicate(timeout=20)[1]
+                first_err = first.communicate(timeout=5)[1]
+                failures = [
+                    (produce[0], first.returncode, first_err),
+                    (consume[0], second.returncode, second_err),
+                ]
+        except FileNotFoundError as exc:
+            raise AudioError("{} not found: {}".format(
+                (consume or produce)[0], exc)) from exc
+        except Exception as exc:
+            raise AudioError("{}: {}".format(type(exc).__name__, exc)) from exc
+
+        for name, code, stderr in failures:
+            if code not in (0, None):
+                detail = (stderr or b"").decode("utf-8", "replace").strip()
+                raise AudioError(
+                    "{} exited {} while speaking the startup phrase on "
+                    "device {}: {}\n"
+                    "  The speech engine is installed, so this is an audio "
+                    "OUTPUT problem, not a TTS problem.\n"
+                    "  List devices with:   aplay -L\n"
+                    "  Test one directly:   espeak-ng --stdout \"test\" | "
+                    "aplay -D <device>\n"
+                    "  Then set it with:    export AUDIO_DEVICE=<device>"
+                    .format(name, code, config.AUDIO_DEVICE or "system default",
+                            " ".join(detail.split())[:200] or "no detail")
+                )
 
     @property
     def command(self):
