@@ -32,6 +32,7 @@ import vision
 import contextlib
 import inspect
 import io
+import subprocess
 
 import main as app
 import hardware.audio as audio_module
@@ -1278,6 +1279,11 @@ try:
           pipeline.startswith("espeak-ng --stdout")
           and pipeline.endswith("aplay -q -D plughw:1,0"), True)
 
+    # speak() above claimed the sound card and there is no controller here
+    # to drain it, so release it explicitly - this section is about the
+    # commands that get built, not the playback lifecycle.
+    audio_module.SPEECH_ACTIVE.clear()
+
     _recorded.clear()
     beeps = audio_module._AplayBackend(
         {audio_module.TONE_DANGER: "/tmp/b.wav",
@@ -2012,6 +2018,166 @@ check("D1 is still GPIO4", config.ROBOT_HAT_PIN_TO_BCM["D1"], 4)
 
 check("the standalone diagnostic exists",
       pathlib.Path("diagnose_ultrasonic.py").exists(), True)
+
+
+# ==========================================================================
+print("\nSpoken guidance cannot fail silently, and beeps stand aside")
+# ==========================================================================
+# This section exists because of a real bug. "plughw:" is a DIRECT hardware
+# ALSA device: exclusive, one process at a time. In DANGER the beeper spawns
+# aplay every 0.15 s, and a spoken phrase needs the same device for one or
+# two seconds - so whichever lost the race got "Device or resource busy".
+#
+# Worse, _spawn() sent stderr to DEVNULL and nothing ever checked the child
+# exit code, so the phrase produced no sound and NOTHING said so: the log
+# showed AI ACCEPTED and SPEECH PLAYING, and the headphones stayed quiet.
+
+check("beeps pause for speech by default",
+      config.BEEP_PAUSE_WHILE_SPEAKING, True)
+check("a shared speech-active flag exists",
+      isinstance(audio_module.SPEECH_ACTIVE, threading.Event), True)
+check("and a helper to read it", callable(audio_module.speech_is_active), True)
+
+spawn_src = inspect.getsource(audio_module.SpeechPlayer._spawn)
+check("speech stderr is CAPTURED, not discarded",
+      "stderr\": subprocess.PIPE" in spawn_src, True)
+check("and is no longer sent to DEVNULL",
+      "stderr\": subprocess.DEVNULL" in spawn_src, False)
+check("the player can report a playback failure",
+      callable(getattr(audio_module.SpeechPlayer, "playback_failure", None)),
+      True)
+
+
+class _BusyProc:
+    """espeak succeeds, aplay fails with EBUSY - the exact original bug."""
+
+    fail_aplay = True
+    BUSY = b"aplay: audio open error: Device or resource busy"
+
+    def __init__(self, args, **kwargs):
+        self.args = list(args)
+        self._aplay = "aplay" in self.args[0]
+        self._born = time.monotonic()
+        self.returncode = None
+        self.stderr = None
+        self.stdout = type("P", (), {"close": lambda s: None})()
+
+    def poll(self):
+        if time.monotonic() - self._born < 0.05:
+            return None
+        if self.returncode is None:
+            failing = self._aplay and _BusyProc.fail_aplay
+            self.returncode = 1 if failing else 0
+            payload = _BusyProc.BUSY if failing else b""
+            self.stderr = type(
+                "E", (), {"read": staticmethod(lambda p=payload: p)})()
+        return self.returncode
+
+    def communicate(self, timeout=None):
+        return (b"", b"")
+
+    def terminate(self):
+        self.returncode = -15
+
+
+class _OkCompleted:
+    returncode = 0
+    stdout = b"espeak-ng text-to-speech: 1.51"
+    stderr = b""
+
+
+_real_popen = subprocess.Popen
+_real_run = subprocess.run
+_saved_device = config.AUDIO_DEVICE
+try:
+    config.AUDIO_DEVICE = "plughw:1,0"
+    subprocess.run = lambda a, **k: _OkCompleted()
+    subprocess.Popen = _BusyProc
+
+    _BusyProc.fail_aplay = False
+    player = audio_module.SpeechPlayer().open()
+    talker = SpeechController(player)
+    talker.start()
+    try:
+        # --- a phrase that loses the sound card must be REPORTED ---------
+        _BusyProc.fail_aplay = True
+        logged = _capture(lambda: talker.say("Unknown object directly ahead."))
+        check("a queued phrase is logged", "SPEECH QUEUED" in logged, True)
+        check("a phrase whose playback failed is reported",
+              "SPEECH FAILED (no sound)" in logged, True)
+        check("with the real ALSA reason",
+              "Device or resource busy" in logged, True)
+        check("and it names the phrase that was lost",
+              "Unknown object directly ahead." in logged, True)
+        check("and the failure is exposed on the controller",
+              talker.error is not None, True)
+        check("the message points at the actual cause",
+              "exclusive ALSA device" in logged, True)
+
+        # --- a phrase that plays fine must NOT be flagged -----------------
+        _BusyProc.fail_aplay = False
+        audio_module.SPEECH_ACTIVE.clear()
+        logged = _capture(lambda: talker.say("Chair directly ahead, move left."))
+        check("a successful phrase is not reported as failed",
+              "SPEECH FAILED" in logged, False)
+        check("and clears the previous error", talker.error, None)
+    finally:
+        talker.stop()
+
+    # --- the beeper stands aside while a phrase holds the card -----------
+    beeps = audio_module._AplayBackend(
+        {audio_module.TONE_DANGER: "/tmp/b.wav",
+         audio_module.TONE_WARNING: "/tmp/w.wav"})
+
+    audio_module.SPEECH_ACTIVE.set()
+    before = beeps._skipped_for_speech
+    for _ in range(6):
+        beeps.play(audio_module.TONE_DANGER)
+    check("every beep stands aside while speech holds the device",
+          beeps._skipped_for_speech - before, 6)
+    check("and none were spawned", beeps._processes, [])
+
+    # --- and resume the instant the phrase ends --------------------------
+    audio_module.SPEECH_ACTIVE.clear()
+    beeps.play(audio_module.TONE_DANGER)
+    check("beeps resume as soon as the phrase finishes",
+          len(beeps._processes) > 0, True)
+
+    # --- our own terminate() must not count as a playback failure -------
+    interrupted = _BusyProc(["aplay", "-q"])
+    interrupted.terminate()
+    solo = audio_module.SpeechPlayer()
+    solo._finished = [interrupted]
+    check("a phrase we deliberately cut off is not a failure",
+          solo.playback_failure(), None)
+finally:
+    subprocess.Popen = _real_popen
+    subprocess.run = _real_run
+    config.AUDIO_DEVICE = _saved_device
+    audio_module.SPEECH_ACTIVE.clear()
+
+# SAFETY BACKSTOP: a stuck flag must never silence the warning forever.
+audio_module.SPEECH_ACTIVE.set()
+audio_module._SPEECH_ACTIVE_SINCE[0] = time.monotonic()
+check("the beeps do stand aside for a phrase in progress",
+      audio_module.speech_is_active(), True)
+
+audio_module._SPEECH_ACTIVE_SINCE[0] = (
+    time.monotonic() - config.SPEECH_MAX_HOLD_S - 1)
+_released = _capture(lambda: None)
+check("a flag held too long is force-released",
+      audio_module.speech_is_active(), False)
+check("so the danger beeps can never be silenced indefinitely",
+      audio_module.SPEECH_ACTIVE.is_set(), False)
+check("the hold ceiling is well above any real phrase",
+      config.SPEECH_MAX_HOLD_S >= 4.0, True)
+audio_module.SPEECH_ACTIVE.clear()
+
+# The danger warning itself is untouched by any of this.
+check("the danger beep interval is unchanged",
+      config.BEEP_INTERVAL_DANGER_S, 0.15)
+check("DANGER still never mutes speech",
+      hasattr(config, "SPEECH_MUTE_IN_DANGER"), False)
 
 
 # ==========================================================================

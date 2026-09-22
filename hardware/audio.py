@@ -57,6 +57,45 @@ class AudioError(RuntimeError):
     """Raised when audio cannot be initialised or played."""
 
 
+# Set while a spoken phrase is actually being produced.
+#
+# The beeps and the voice are separate processes writing to the SAME ALSA
+# device, and a "plughw:" device is exclusive - one process at a time. The
+# loser gets EBUSY and plays nothing. This flag lets the beeper stand aside
+# for the length of a phrase instead of stealing the card from it.
+#
+# Module level on purpose: BeepPlayer and SpeechPlayer are built separately
+# and never see each other, but they share one sound card.
+SPEECH_ACTIVE = threading.Event()
+_SPEECH_ACTIVE_SINCE = [0.0]
+
+
+def mark_speech_active():
+    """Claim the sound card for a phrase."""
+    _SPEECH_ACTIVE_SINCE[0] = time.monotonic()
+    SPEECH_ACTIVE.set()
+
+
+def speech_is_active():
+    """True while a spoken phrase is holding the sound card.
+
+    Time-bounded on purpose. Standing aside for a phrase is fine; standing
+    aside forever because a flag got stuck would silence the collision
+    warning, which is unacceptable. After SPEECH_MAX_HOLD_S the flag is
+    cleared and the beeps resume no matter what.
+    """
+    if not SPEECH_ACTIVE.is_set():
+        return False
+    held_for = time.monotonic() - _SPEECH_ACTIVE_SINCE[0]
+    if held_for > config.SPEECH_MAX_HOLD_S:
+        SPEECH_ACTIVE.clear()
+        print("AUDIO WARNING: speech held the sound card for {:.1f}s; "
+              "releasing it so the danger beeps resume.".format(held_for),
+              flush=True)
+        return False
+    return True
+
+
 # The two sounds this project makes.
 TONE_DANGER = "danger"     # urgent, repeated while closer than 25 cm
 TONE_WARNING = "warning"   # subtle, played once on entering 25-50 cm
@@ -196,6 +235,8 @@ class _PygameBackend:
         return os.environ.get("SDL_AUDIODRIVER")
 
     def play(self, tone=TONE_DANGER):
+        if config.BEEP_PAUSE_WHILE_SPEAKING and speech_is_active():
+            return
         # Sound.play() returns immediately; the mixer thread does the work.
         self._sounds[tone].play()
 
@@ -214,6 +255,7 @@ class _AplayBackend:
     def __init__(self, wav_paths):
         self._wav_paths = {tone: str(path) for tone, path in wav_paths.items()}
         self._processes = []
+        self._skipped_for_speech = 0
 
         # "-D <device>" pins playback to one ALSA device, so a Robot HAT I2S
         # speaker that has become the system default cannot steal the beeps.
@@ -269,6 +311,13 @@ class _AplayBackend:
             )
 
     def play(self, tone=TONE_DANGER):
+        # Stand aside while a phrase is being spoken. Starting aplay now
+        # would take the exclusive device away from the voice, and one of
+        # the two would be silent. The beep resumes on the next interval.
+        if config.BEEP_PAUSE_WHILE_SPEAKING and speech_is_active():
+            self._skipped_for_speech += 1
+            return
+
         # Drop finished processes so we do not leave zombies behind.
         self._processes = [p for p in self._processes if p.poll() is None]
         if len(self._processes) >= 4:
@@ -524,6 +573,7 @@ class SpeechPlayer:
     def __init__(self):
         self._command = None        # e.g. "espeak-ng"
         self._processes = []
+        self._finished = []         # kept so exit codes can be inspected
         self._wav_path = None       # only used by the pico2wave backend
         self.description = "not opened"
 
@@ -680,18 +730,29 @@ class SpeechPlayer:
 
         self.stop()          # never overlap two voices
 
+        # Claim the sound card for the whole phrase, so the beeper stands
+        # aside instead of taking the exclusive device out from under it.
+        mark_speech_active()
         try:
             self._processes = self._spawn(phrase)
         except Exception as exc:
+            SPEECH_ACTIVE.clear()
             raise AudioError(
                 "{} failed: {}: {}".format(
                     self._command, type(exc).__name__, exc)
             ) from exc
+        self._finished = list(self._processes)
         return True
 
     def _spawn(self, phrase):
-        """Launch the backend. Returns the list of processes to track."""
-        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        """Launch the backend. Returns the list of processes to track.
+
+        stderr is CAPTURED, not discarded. Discarding it is how a spoken
+        phrase could vanish without a trace: aplay would exit 1 with
+        "Device or resource busy" because a beep held the exclusive device,
+        and nothing anywhere noticed.
+        """
+        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE}
 
         if self._command == "pico2wave":
             # Two steps: synthesise to a WAV, then play it with aplay, which
@@ -729,9 +790,43 @@ class SpeechPlayer:
             [self._command] + rate + amp + [phrase], **quiet)]
 
     def is_speaking(self):
-        """True while a phrase is still being produced."""
+        """True while a phrase is still being produced.
+
+        Also the place the shared SPEECH_ACTIVE flag is released. Clearing
+        it here rather than only in stop() makes it self-healing: if
+        anything ever calls speak() without draining it through
+        SpeechController, the flag cannot get stuck set and silently
+        suppress the danger beeps forever.
+        """
         self._processes = [pr for pr in self._processes if pr.poll() is None]
-        return bool(self._processes)
+        speaking = bool(self._processes)
+        if not speaking:
+            SPEECH_ACTIVE.clear()
+        return speaking
+
+    def playback_failure(self):
+        """Why the last phrase produced no sound, or None if it was fine.
+
+        Called once a phrase has finished. Every process in the pipeline is
+        checked, so an `aplay` that lost the sound card can no longer fail
+        in silence.
+        """
+        problems = []
+        for process in self._finished:
+            code = process.returncode
+            if code in (0, None, -15):      # -15 is our own terminate()
+                continue
+            detail = ""
+            try:
+                if process.stderr is not None:
+                    detail = process.stderr.read().decode(
+                        "utf-8", "replace").strip()
+            except Exception:
+                pass
+            problems.append("{} exited {}{}".format(
+                process.args[0] if process.args else "?", code,
+                ": " + " ".join(detail.split())[:120] if detail else ""))
+        return "; ".join(problems) if problems else None
 
     def stop(self):
         """Cut off the current phrase immediately. Safe to call any time."""
@@ -742,6 +837,7 @@ class SpeechPlayer:
             except Exception:
                 pass
         self._processes = []
+        SPEECH_ACTIVE.clear()
 
     def close(self):
         self.stop()
@@ -935,6 +1031,7 @@ class SpeechController(threading.Thread):
         print("SPEECH PLAYING: {}".format(text), flush=True)
 
         # Wait for it to finish, but stay responsive to mute and shutdown.
+        interrupted = False
         while self._player.is_speaking():
             if self._stop_event.is_set() or self.muted:
                 # set_muted() already logged and stopped an explicit mute;
@@ -943,8 +1040,32 @@ class SpeechController(threading.Thread):
                 print("SPEECH INTERRUPTED: {} - {}".format(
                     "shutdown" if self._stop_event.is_set() else "muted",
                     text), flush=True)
+                interrupted = True
                 break
             self._stop_event.wait(self.POLL_S)
+
+        # The phrase has finished. Release the sound card so the beeps can
+        # resume, then check whether it actually made a sound: a pipeline
+        # that exited non-zero played nothing, and used to do so in total
+        # silence.
+        SPEECH_ACTIVE.clear()
+        if not interrupted:
+            failure = None
+            try:
+                failure = self._player.playback_failure()
+            except Exception as exc:
+                failure = "{}: {}".format(type(exc).__name__, exc)
+            if failure:
+                with self._lock:
+                    self._error = failure
+                print("SPEECH FAILED (no sound): {} - {}".format(
+                    failure, text), flush=True)
+                print("  The speech engine ran but playback failed. If this "
+                      "says 'Device or resource busy', a beep held the "
+                      "exclusive ALSA device; check "
+                      "BEEP_PAUSE_WHILE_SPEAKING in config.py, or use "
+                      "AUDIO_DEVICE=plug:dmix:1,0 to allow mixing.",
+                      flush=True)
 
     def stop(self, timeout=2.0):
         self._stop_event.set()

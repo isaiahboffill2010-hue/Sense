@@ -526,6 +526,32 @@ SPEECH_DUPLICATE_GAP_S = 12.0
 # 1.0 disables spacing entirely (beeps keep their normal urgent rhythm).
 # The result is clamped so the beeps can never stop or become slower than
 # BEEP_MAX_INTERVAL_WHILE_SPEAKING_S.
+# While a phrase is being spoken, HOLD the beeps rather than letting them
+# fight for the sound card.
+#
+# A "plughw:" device is a DIRECT hardware device: exclusive, one process at
+# a time. The beeper spawns `aplay` every 0.15 s in DANGER, and speech needs
+# the same device for one or two seconds - so whichever loses the race gets
+# "Device or resource busy" and produces silence. That is precisely why
+# accepted guidance was never heard at close range while the beeps worked.
+#
+# With this True the beeper skips its beeps for the duration of a phrase and
+# resumes the instant it finishes, which is the "pause the beeps while TTS
+# speaks, then resume" behaviour. The pause lasts only as long as the
+# phrase, and the spoken guidance IS the warning during that window.
+#
+# Set to False if you would rather have both at once - but then point
+# AUDIO_DEVICE at a mixing device or you will simply get dropouts:
+#     export AUDIO_DEVICE=plug:dmix:1,0
+BEEP_PAUSE_WHILE_SPEAKING = True
+
+# Hard ceiling on how long the beeps will ever stand aside for speech.
+# No phrase we speak lasts anywhere near this long, so if the flag is still
+# set after this the flag itself is wrong - and a stuck flag must NEVER be
+# able to silence the collision warning indefinitely. This is the backstop
+# that guarantees the danger beep always comes back.
+SPEECH_MAX_HOLD_S = 6.0
+
 BEEP_SPACING_WHILE_SPEAKING = 2.0
 BEEP_MAX_INTERVAL_WHILE_SPEAKING_S = 0.40
 
