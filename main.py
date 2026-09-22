@@ -168,8 +168,13 @@ def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None,
 
       1. the local beeps are driven FIRST, straight from the ultrasonic
          reading, and never wait on anything
-      2. DANGER silences speech, cutting off any phrase mid-word
+      2. while a phrase is being spoken the danger beeps are SPACED OUT so
+         both stay intelligible - they are never silenced or disabled
       3. only then is Gemini given a frame, via a call that cannot block
+
+    The DANGER band deliberately does NOT mute speech. Guidance such as
+    "Table leg ahead, move left." is at its most useful when the obstacle
+    is closest, so accepted guidance is allowed to speak over the beeps.
 
     IMPORTANT: the caller must invoke this BEFORE ui.draw_hud(), because
     draw_hud mutates the frame in place. Queueing afterwards would send
@@ -180,15 +185,14 @@ def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None,
 
     # --- 1. immediate collision warning, always first ---------------------
     if beeper is not None:
-        # Repeated beeps: only DANGER sets a non-None interval.
-        beeper.set_interval(decision.repeat_interval)
+        # Repeated beeps: only DANGER sets a non-None interval. Spacing them
+        # out while a phrase plays keeps both intelligible; the interval can
+        # never become None here, so the warning can never be switched off.
+        beeper.set_interval(beep_interval_with_speech(
+            decision.repeat_interval, speech))
         # One subtle tone, exactly on entering the WARNING band.
         if decision.play_warning_tone:
             beeper.play_once(TONE_WARNING)
-
-    # --- 2. danger outranks speech ----------------------------------------
-    if speech is not None and config.SPEECH_MUTE_IN_DANGER:
-        speech.set_muted(decision.status == alerts.DANGER)
 
     # --- 3. supplemental scene understanding ------------------------------
     if vision is not None:
@@ -200,6 +204,37 @@ def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None,
             vision.request(frame, distance, decision.status, decision.ai_reason)
 
     return decision.status
+
+
+def beep_interval_with_speech(interval, speech):
+    """Space out the repeating beep while a phrase is being spoken.
+
+    Returns the interval to use. Crucially this NEVER returns None when it
+    was given a real interval: the danger warning is spaced, never
+    silenced, so a spoken phrase can be understood without the collision
+    warning stopping.
+    """
+    if interval is None or speech is None:
+        return interval
+
+    factor = config.BEEP_SPACING_WHILE_SPEAKING
+    if factor <= 1.0:
+        return interval
+
+    # This runs on the collision-warning path, so it must never raise. If
+    # we cannot tell whether speech is playing, keep the normal urgent
+    # rhythm - erring towards a faster warning, never towards none.
+    try:
+        speaking = bool(getattr(speech, "speaking", False))
+    except Exception:
+        speaking = False
+
+    if not speaking:
+        return interval
+
+    # Clamped so the beeps stay recognisably urgent no matter how the
+    # factor is configured.
+    return min(interval * factor, config.BEEP_MAX_INTERVAL_WHILE_SPEAKING_S)
 
 
 def speak_new_guidance(vision, speech, spoken_generation):

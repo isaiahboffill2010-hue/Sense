@@ -919,7 +919,7 @@ check("frames are downscaled before upload",
 
 
 # ==========================================================================
-print("\nSpeech: newest wins, no repeats, danger interrupts")
+print("\nSpeech: newest wins, no repeats, explicit mute interrupts")
 # ==========================================================================
 
 
@@ -976,7 +976,9 @@ try:
     time.sleep(0.3)
     check("and is spoken", "Chair ahead, move right." in voice.spoken, True)
 
-    # Danger silences speech and cuts off what is playing.
+    # An explicit mute silences speech and cuts off what is playing.
+    # NOTE: the DANGER band does NOT do this - see the dedicated section
+    # below. Only shutdown mutes.
     stops_before = voice.stops
     talker.set_muted(True)
     check("muting stops the current phrase", voice.stops > stops_before, True)
@@ -1012,7 +1014,8 @@ check("only the newest phrase is pending", talker2._pending_text,
 # Truncation keeps assistive audio short.
 check("a long phrase is truncated",
       len(_clean_for_speech("x" * 500)), config.SPEECH_MAX_CHARS)
-check("danger muting is enabled by default", config.SPEECH_MUTE_IN_DANGER, True)
+check("beeps are spaced, not silenced, while speaking",
+      config.BEEP_SPACING_WHILE_SPEAKING >= 1.0, True)
 
 
 # ==========================================================================
@@ -1518,13 +1521,14 @@ try:
 
     # Danger arrives mid-phrase: the voice must be cut off and say so.
     logged = _capture(lambda: talker.set_muted(True))
-    check("danger interrupts the phrase in progress", voice.stops >= 1, True)
+    check("an explicit mute interrupts the phrase in progress",
+          voice.stops >= 1, True)
     check("and the interruption is logged",
-          "SPEECH INTERRUPTED: danger" in logged, True)
+          "SPEECH INTERRUPTED: muted" in logged, True)
 
     logged = _capture(lambda: talker.say("Chair ahead, move right."))
-    check("a phrase during danger is suppressed with the reason",
-          "SPEECH SUPPRESSED: danger" in logged, True)
+    check("a phrase while explicitly muted is suppressed with the reason",
+          "SPEECH SUPPRESSED: muted" in logged, True)
 
     talker.set_muted(False)
     voice.busy = False
@@ -1539,7 +1543,170 @@ try:
 finally:
     talker.stop()
 
-check("danger muting is still enabled", config.SPEECH_MUTE_IN_DANGER, True)
+check("nothing in the navigation logic mutes speech",
+      "set_muted" in open("main.py", encoding="utf-8").read(), False)
+
+
+# ==========================================================================
+print("\nDANGER: guidance speaks AND the local warning keeps going")
+# ==========================================================================
+# The DANGER band used to mute speech outright, which threw away exactly
+# the guidance you most want at 20 cm ("Table leg ahead, move left.").
+# Now both happen: the beeps are driven straight from the sensor and are
+# only SPACED OUT while a phrase plays.
+
+
+class _Beeps:
+    """Records every interval the main loop sets."""
+
+    error = None
+
+    def __init__(self):
+        self.intervals = []
+        self.tones = []
+
+    def set_interval(self, interval):
+        self.intervals.append(interval)
+
+    def play_once(self, tone):
+        self.tones.append(tone)
+
+
+class _Talker:
+    """A speech controller stand-in that reports whether it is speaking."""
+
+    def __init__(self):
+        self.said = []
+        self.speaking = False
+        self.muted = False
+
+    def say(self, text):
+        self.said.append(text)
+        self.speaking = True
+        return True
+
+    def set_muted(self, muted):
+        self.muted = bool(muted)
+
+
+def _danger_snapshot(distance=18.0):
+    return {"distance_cm": distance, "out_of_range": False, "error": None,
+            "healthy": True, "reading_count": 9}
+
+
+# --- an accepted result while in DANGER must be spoken -------------------
+policy = alerts.AlertPolicy()
+beeps = _Beeps()
+talker = _Talker()
+worker, logged = _worker_with_reply(1.0, "Table leg ahead, move left.")
+worker.note_current_state(18.0, "DANGER")
+
+status = app.apply_alert_policy(
+    policy, _danger_snapshot(), beeps, FakeFrame(), worker, talker)
+check("the band is DANGER", status, "DANGER")
+check("the danger beep is running", beeps.intervals[-1] is not None, True)
+check("speech was NOT muted by the DANGER band", talker.muted, False)
+
+spoken = app.speak_new_guidance(worker, talker, 0)
+check("accepted guidance IS spoken in DANGER",
+      talker.said, ["Table leg ahead, move left."])
+check("and the generation advanced", spoken, worker.snapshot()["generation"])
+check("acceptance was logged", "AI ACCEPTED:" in logged, True)
+
+# --- the warning must keep going while the phrase plays ------------------
+talker.speaking = True
+for _ in range(5):
+    app.apply_alert_policy(
+        policy, _danger_snapshot(), beeps, FakeFrame(), worker, talker)
+
+while_speaking = beeps.intervals[-5:]
+check("the beep interval is never disabled while speaking",
+      all(i is not None for i in while_speaking), True)
+check("every interval is a real, finite number",
+      all(isinstance(i, float) and i > 0 for i in while_speaking), True)
+check("the beeps are SPACED OUT while speaking",
+      all(i > config.BEEP_INTERVAL_DANGER_S for i in while_speaking), True)
+check("but never slower than the clamp",
+      all(i <= config.BEEP_MAX_INTERVAL_WHILE_SPEAKING_S
+          for i in while_speaking), True)
+
+# --- and return to the urgent rhythm the moment the phrase ends ----------
+talker.speaking = False
+app.apply_alert_policy(
+    policy, _danger_snapshot(), beeps, FakeFrame(), worker, talker)
+check("the urgent rhythm returns when the phrase finishes",
+      beeps.intervals[-1], config.BEEP_INTERVAL_DANGER_S)
+
+# --- a real SpeechController accepts a phrase while in DANGER -----------
+voice = _SlowVoice()
+real_talker = SpeechController(voice)
+real_talker.start()
+try:
+    policy = alerts.AlertPolicy()
+    beeps = _Beeps()
+    # Walk straight into DANGER.
+    app.apply_alert_policy(policy, _danger_snapshot(150.0), beeps,
+                           FakeFrame(), None, real_talker)
+    app.apply_alert_policy(policy, _danger_snapshot(18.0), beeps,
+                           FakeFrame(), None, real_talker)
+    check("the real controller is not muted in DANGER",
+          real_talker.muted, False)
+
+    logged = _capture(lambda: real_talker.say("Obstacle ahead."))
+    check("the phrase is queued, not suppressed",
+          "SPEECH QUEUED: Obstacle ahead." in logged, True)
+    check("and reaches the voice",
+          "SPEECH PLAYING: Obstacle ahead." in logged, True)
+    check("nothing was suppressed for danger",
+          "SPEECH SUPPRESSED" in logged, False)
+    check("it was actually spoken", voice.spoken, ["Obstacle ahead."])
+
+    # With the phrase still playing, the danger beep must still be set.
+    interval = app.beep_interval_with_speech(
+        config.BEEP_INTERVAL_DANGER_S, real_talker)
+    check("the danger beep survives a phrase in progress",
+          interval is not None, True)
+    check("spaced out while it plays",
+          interval > config.BEEP_INTERVAL_DANGER_S, True)
+finally:
+    real_talker.stop()
+
+# --- every other protection still applies inside DANGER -----------------
+talker = _Talker()
+worker, _logged = _worker_with_reply(1.0, "Person ahead, left.")
+worker.note_current_state(18.0, "DANGER")
+generation = 0
+for _ in range(10):
+    generation = app.speak_new_guidance(worker, talker, generation)
+check("duplicate/generation suppression still holds in DANGER",
+      len(talker.said), 1)
+
+# A superseded reply must still be rejected, DANGER or not.
+worker = vision.GeminiWorker()
+worker._latest_request_id = 7
+worker._encode_jpeg = staticmethod(lambda frame: b"jpeg")
+worker._call_gemini = lambda jpeg, distance: "Stale guidance."
+worker.note_current_state(18.0, "DANGER")
+with contextlib.redirect_stdout(io.StringIO()):
+    worker._process_request(vision.AiRequest(
+        FakeFrame(), 18.0, "DANGER", time.monotonic(), 1, "band"))
+talker = _Talker()
+app.speak_new_guidance(worker, talker, 0)
+check("newest-wins still rejects a superseded reply in DANGER",
+      talker.said, [])
+
+# An obstacle that vanished is still rejected.
+worker = vision.GeminiWorker()
+worker._latest_request_id = 1
+worker._encode_jpeg = staticmethod(lambda frame: b"jpeg")
+worker._call_gemini = lambda jpeg, distance: "Gone guidance."
+worker.note_current_state(None, "SAFE")
+with contextlib.redirect_stdout(io.StringIO()):
+    worker._process_request(vision.AiRequest(
+        FakeFrame(), 18.0, "DANGER", time.monotonic(), 1, "band"))
+talker = _Talker()
+app.speak_new_guidance(worker, talker, 0)
+check("relevance still rejects a vanished obstacle", talker.said, [])
 
 
 # ==========================================================================

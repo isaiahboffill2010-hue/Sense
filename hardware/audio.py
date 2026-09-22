@@ -758,9 +758,11 @@ class SpeechController(threading.Thread):
       * NO REPEATS. The same phrase is not spoken again within
         SPEECH_DUPLICATE_GAP_S, so standing in a doorway does not produce
         "Doorway right." over and over.
-      * DANGER INTERRUPTS. set_muted(True) cuts off the current phrase
-        within ~50 ms and drops anything pending, so the rapid danger beeps
-        are never competing with a sentence.
+      * MUTING IS EXPLICIT ONLY. set_muted(True) cuts off the current
+        phrase within ~50 ms and drops anything pending. Nothing in the
+        navigation logic calls it - the DANGER band deliberately does NOT
+        mute speech, because guidance is most useful when an obstacle is
+        closest. Shutdown is the only caller.
 
     Attribute names here deliberately avoid everything threading.Thread
     uses internally - see the guard in test_alerts.py.
@@ -798,7 +800,7 @@ class SpeechController(threading.Thread):
         reason = None
         with self._lock:
             if self._muted:
-                reason = "danger" if config.SPEECH_MUTE_IN_DANGER else "muted"
+                reason = "muted"
             else:
                 gap = config.SPEECH_DUPLICATE_GAP_S
                 if (
@@ -851,13 +853,27 @@ class SpeechController(threading.Thread):
                 pass
             self._player.stop()
             if was_speaking:
-                print("SPEECH INTERRUPTED: danger - {}".format(current or ""),
+                print("SPEECH INTERRUPTED: muted - {}".format(current or ""),
                       flush=True)
 
     @property
     def muted(self):
         with self._lock:
             return self._muted
+
+    @property
+    def speaking(self):
+        """True while a phrase is actually being produced.
+
+        Read every frame by the main loop, which uses it to space out the
+        danger beeps so a spoken phrase stays intelligible. Deliberately
+        tolerant: if the player cannot say, we report False and the beeps
+        simply keep their normal urgent rhythm.
+        """
+        try:
+            return bool(self._player.is_speaking())
+        except Exception:
+            return False
 
     @property
     def error(self):
@@ -921,15 +937,12 @@ class SpeechController(threading.Thread):
         # Wait for it to finish, but stay responsive to mute and shutdown.
         while self._player.is_speaking():
             if self._stop_event.is_set() or self.muted:
-                # set_muted() already logged and stopped the danger case;
-                # reaching here means shutdown, or a mute we observed first.
+                # set_muted() already logged and stopped an explicit mute;
+                # reaching here is usually shutdown.
                 self._player.stop()
-                if self._stop_event.is_set():
-                    print("SPEECH INTERRUPTED: shutdown - {}".format(text),
-                          flush=True)
-                else:
-                    print("SPEECH INTERRUPTED: danger - {}".format(text),
-                          flush=True)
+                print("SPEECH INTERRUPTED: {} - {}".format(
+                    "shutdown" if self._stop_event.is_set() else "muted",
+                    text), flush=True)
                 break
             self._stop_event.wait(self.POLL_S)
 

@@ -223,6 +223,16 @@ PLAY_STARTUP_TEST_BEEP = True
 #     AUDIO_DEVICE = "plughw:CARD=Headphones,DEV=0"
 #     AUDIO_DEVICE = "plughw:1,0"
 #
+# NOTE ON SIMULTANEOUS SOUNDS: danger beeps and spoken guidance can now
+# play at the same time. A bare "plughw:" device is exclusive - one process
+# holds it - so a beep may be skipped while a phrase is playing. If you want
+# them properly mixed, name a device that supports it:
+#
+#     export AUDIO_DEVICE=plug:dmix:1,0
+#
+# Beeps that lose the race are simply skipped and retried on the next
+# interval; the warning keeps going either way.
+#
 # It can also be set from the shell, which is usually easier while you are
 # still working out which device is which:
 #
@@ -426,10 +436,27 @@ SPEECH_VOLUME = 110
 # ahead, left." being spoken over and over while you stand in a doorway.
 SPEECH_DUPLICATE_GAP_S = 12.0
 
-# SAFETY: while the distance is in the DANGER band, speech is silenced and
-# any phrase already being spoken is cut off, so the rapid danger beeps are
-# never competing with a sentence. Leave this True.
-SPEECH_MUTE_IN_DANGER = True
+# SAFETY: the DANGER band no longer silences speech.
+#
+# The repeated urgent beeps are driven straight from the ultrasonic reading
+# and always continue - they are the collision warning and never wait for
+# anything. But accepted Gemini guidance is allowed to speak over them,
+# because "Table leg ahead, move left." is exactly what you most want to
+# hear at 20 cm. Guidance is never discarded merely for arriving while the
+# distance happens to be in the DANGER band.
+#
+# To keep both intelligible, the danger beeps are SPACED OUT - not silenced,
+# not quietened - while a phrase is being spoken. The interval is multiplied
+# by this factor for the duration of the phrase only.
+#
+# 1.0 disables spacing entirely (beeps keep their normal urgent rhythm).
+# The result is clamped so the beeps can never stop or become slower than
+# BEEP_MAX_INTERVAL_WHILE_SPEAKING_S.
+BEEP_SPACING_WHILE_SPEAKING = 2.0
+BEEP_MAX_INTERVAL_WHILE_SPEAKING_S = 0.40
+
+# Speech can still be muted explicitly (SpeechController.set_muted), which
+# is what shutdown uses. Nothing in the navigation logic mutes it.
 
 # Longest phrase we will speak. Anything longer is truncated - assistive
 # audio must stay short.
