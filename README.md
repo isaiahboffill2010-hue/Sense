@@ -171,19 +171,19 @@ system into the headphones, in both ears.
 ## Wiring
 
 The ultrasonic sensor plugs into the Robot HAT's 3-pin **digital ports**, so
-the code addresses it by Robot HAT port name (`"D2"`, `"D3"`) rather than by
+the code addresses it by Robot HAT port name (`"D0"`, `"D1"`) rather than by
 raw pin number. Each port is hard-wired by the HAT to one BCM GPIO:
 
 | Signal | Cable colour | Robot HAT port | BCM GPIO |
 | --- | --- | --- | --- |
-| VCC | **red** | red power pin of the **D2** port | — |
-| TRIG | **yellow** | yellow signal pin of the **D2** port | GPIO27 |
-| ECHO | **white** | yellow signal pin of the **D3** port | GPIO22 |
-| GND | **black** | black ground pin of the **D3** port | — |
+| VCC | **red** | red power pin of the **D0** port | — |
+| TRIG | **yellow** | yellow signal pin of the **D0** port | GPIO17 |
+| ECHO | **white** | yellow signal pin of the **D1** port | GPIO4 |
+| GND | **black** | black ground pin of the **D1** port | — |
 
 Splitting the 4-wire cable across two 3-pin ports like this is fine — all of
 the HAT's digital ports share the same VCC and GND rails, so the sensor still
-gets power from D2 and ground from D3.
+gets power from D0 and ground from D1.
 
 For reference, the full digital port map on this HAT is
 `D0 → GPIO17`, `D1 → GPIO4`, `D2 → GPIO27`, `D3 → GPIO22`.
@@ -418,7 +418,7 @@ environment, never hardcoded, never printed, and never committed.
 
 Already cloned it before? Just `cd ~/Sense && git pull`.
 
-`TRIG_PIN` and `ECHO_PIN` are already set to `"D2"` and `"D3"` in
+`TRIG_PIN` and `ECHO_PIN` are already set to `"D0"` and `"D1"` in
 [config.py](config.py), matching the wiring table above — if you used those
 ports, there is nothing to edit.
 
@@ -455,8 +455,8 @@ Raspberry Pi detected: Raspberry Pi 3 Model B Plus Rev 1.3
 --------------------------------------------------------------
 Camera: checking...
 Camera: OK - imx219 @ 640x480 (RGB888)
-Ultrasonic sensor: checking... (robot_hat TRIG=D2 (GPIO27) ECHO=D3 (GPIO22))
-Ultrasonic sensor: OK - robot_hat TRIG=D2 (GPIO27) ECHO=D3 (GPIO22) - first reading 84.2 cm
+Ultrasonic sensor: checking... (robot_hat TRIG=D0 (GPIO17) ECHO=D1 (GPIO4))
+Ultrasonic sensor: OK - robot_hat TRIG=D0 (GPIO17) ECHO=D1 (GPIO4) - first reading 84.2 cm
 Audio: checking...
 Audio: OK - pygame.mixer / SDL (pulseaudio)
        beep file: /home/pi/Sense/assets/beep.wav
@@ -514,15 +514,15 @@ python3 -c "import robot_hat; print(robot_hat.__version__)"
 If that works from a plain shell but not from your virtual environment,
 recreate the venv with `--system-site-packages`.
 
-### `ULTRASONIC ERROR: No echo received on ECHO D3`
+### `ULTRASONIC ERROR: No echo received on ECHO D1`
 
 Work down this list:
 
-1. Is the **white ECHO** wire in the **yellow signal** pin of the **D3** port,
-   and the **yellow TRIG** wire in the **yellow signal** pin of the **D2** port?
+1. Is the **white ECHO** wire in the **yellow signal** pin of the **D1** port,
+   and the **yellow TRIG** wire in the **yellow signal** pin of the **D0** port?
    Swapping these two is the most common mistake.
-2. Is the **red VCC** wire in the **red** pin of D2, and the **black GND** wire
-   in the **black** pin of D3?
+2. Is the **red VCC** wire in the **red** pin of D0, and the **black GND** wire
+   in the **black** pin of D1?
 3. Is the Robot HAT seated firmly on all 40 pins, and is it powered (battery
    connected / power switch on)?
 4. Is there anything within about 4 m for the ping to bounce off? Point it at a
@@ -537,7 +537,7 @@ and capitalisation in [config.py](config.py).
 ### `Ultrasonic: NOT CONFIGURED`
 
 `TRIG_PIN` / `ECHO_PIN` are `None` in [config.py](config.py). They ship set to
-`"D2"` / `"D3"`, so this only appears if they were edited.
+`"D0"` / `"D1"`, so this only appears if they were edited.
 
 ### `CAMERA ERROR: No camera detected by libcamera`
 

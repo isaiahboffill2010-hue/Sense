@@ -12,14 +12,14 @@ read on any computer, including Windows.
 PIN NAMING
 --------------------------------------------------------------------------
 The ultrasonic sensor plugs into the SunFounder Robot HAT, so it is named by
-Robot HAT DIGITAL PORT ("D2", "D3") rather than by raw pin number. That is
+Robot HAT DIGITAL PORT ("D0", "D1") rather than by raw pin number. That is
 what the robot_hat library expects.
 
 Each port is hard-wired by the HAT to one **BCM** (Broadcom) GPIO number -
 not to a physical 1-40 header position:
 
-    "D2"  ==  BCM GPIO27  ==  physical pin 13
-    "D3"  ==  BCM GPIO22  ==  physical pin 15
+    "D0"  ==  BCM GPIO17  ==  physical pin 11
+    "D1"  ==  BCM GPIO4   ==  physical pin 7
 
 Run `pinout` on the Raspberry Pi to see the full map for your board.
 """
@@ -42,21 +42,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # the robot_hat library expects. The BCM number each port maps to is fixed by
 # the HAT:
 #
-#     "D0"  ->  GPIO17
-#     "D1"  ->  GPIO4
-#     "D2"  ->  GPIO27     <- TRIG (yellow wire)
-#     "D3"  ->  GPIO22     <- ECHO (white wire)
+#     "D0"  ->  GPIO17     <- TRIG (yellow wire)
+#     "D1"  ->  GPIO4      <- ECHO (white wire)
+#     "D2"  ->  GPIO27
+#     "D3"  ->  GPIO22
 #
 # Sensor cable colours:
 #
-#     RED    VCC   -> red power pin of the D2 port
-#     YELLOW TRIG  -> yellow signal pin of the D2 port
-#     WHITE  ECHO  -> yellow signal pin of the D3 port
-#     BLACK  GND   -> black ground pin of the D3 port
+#     RED    VCC   -> red power pin of the D0 port
+#     YELLOW TRIG  -> yellow signal pin of the D0 port
+#     WHITE  ECHO  -> yellow signal pin of the D1 port
+#     BLACK  GND   -> black ground pin of the D1 port
 #
 # Splitting the 4-wire sensor across two 3-pin ports like this is fine: all
 # of the Robot HAT's digital ports share the same VCC and GND rails, so the
-# sensor still gets power from D2 and ground from D3.
+# sensor still gets power from D0 and ground from D1.
 #
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # A NOTE ON THE OLD 5V ECHO WARNING
@@ -73,8 +73,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # header, or substitute a generic 5V HC-SR04.
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-TRIG_PIN = "D2"   # Robot HAT digital port for TRIG  (yellow wire, GPIO27)
-ECHO_PIN = "D3"   # Robot HAT digital port for ECHO  (white wire,  GPIO22)
+TRIG_PIN = "D0"   # Robot HAT digital port for TRIG  (yellow wire, GPIO17)
+ECHO_PIN = "D1"   # Robot HAT digital port for ECHO  (white wire,  GPIO4)
 
 # Reference only - the robot_hat library resolves the names above itself.
 # Used by the startup report so you can sanity-check against `pinout`.

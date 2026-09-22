@@ -30,6 +30,7 @@ import alerts
 import config
 import vision
 from hardware.audio import TONE_DANGER, TONE_WARNING, BeepController
+from hardware.ultrasonic import UltrasonicMonitor
 
 FAILURES = []
 
@@ -349,7 +350,7 @@ for label, exc in [
     request = vision.AiRequest(FakeFrame(), 80.0, time.monotonic())
     raised = None
     try:
-        w._handle(request)
+        w._process_request(request)
     except Exception as caught:          # must never escape the worker
         raised = caught
     snap = w.snapshot()
@@ -361,7 +362,7 @@ for label, exc in [
 w = vision.GeminiWorker()
 w._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
 w._call_gemini = lambda jpeg, distance: "   "
-w._handle(vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
+w._process_request(vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
 check("empty reply is not shown", w.snapshot()["description"], None)
 
 
@@ -373,7 +374,7 @@ w._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
 w._call_gemini = lambda jpeg, distance: "Chair directly ahead."
 
 # Fresh reply -> shown.
-w._handle(vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
+w._process_request(vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
 check("a fresh description is shown",
       w.snapshot()["description"], "Chair directly ahead.")
 check("one reply counted", w.snapshot()["reply_count"], 1)
@@ -389,7 +390,7 @@ w2 = vision.GeminiWorker()
 w2._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
 w2._call_gemini = lambda jpeg, distance: "Person ahead."
 old_capture = time.monotonic() - (config.GEMINI_RESULT_MAX_AGE_S + 5)
-w2._handle(vision.AiRequest(FakeFrame(), 80.0, old_capture))
+w2._process_request(vision.AiRequest(FakeFrame(), 80.0, old_capture))
 snap = w2.snapshot()
 check("a reply born stale is discarded", snap["description"], None)
 check("and counted as discarded", snap["discarded_count"], 1)
@@ -598,6 +599,74 @@ finally:
 # budget now exceeds it, because replies that slow would be discarded.
 check("staleness window is still the tightest limit (by design)",
       config.GEMINI_RESULT_MAX_AGE_S <= config.GEMINI_REQUEST_TIMEOUT_S, True)
+
+
+# ==========================================================================
+print("\nNo thread class shadows a threading.Thread internal")
+# ==========================================================================
+# This guard exists because of a real bug. GeminiWorker once had a method
+# called _handle. CPython 3.13's Thread.start() assigns an INSTANCE attribute
+# named _handle holding a _thread._ThreadHandle, and an instance attribute
+# shadows a class method - so the method became unreachable the moment the
+# thread started, and calling it raised:
+#
+#     TypeError: '_thread._ThreadHandle' object is not callable
+#
+# Python 3.12 has no such attribute and 3.14 renamed it to
+# _os_thread_handle, so it only reproduced on 3.13 - which is what Raspberry
+# Pi OS ships. It also survived every test, because nothing called the method
+# on a STARTED thread. This check is version-independent: it compares names
+# directly, so it fails on the development machine too.
+
+THREAD_INTERNALS = {
+    "_handle",            # 3.13: _thread._ThreadHandle
+    "_os_thread_handle",  # 3.14 rename of the above
+    "_target", "_name", "_args", "_kwargs", "_daemonic", "_ident",
+    "_native_id", "_tstate_lock", "_started", "_is_stopped", "_initialized",
+    "_stderr", "_invoke_excepthook", "_bootstrap", "_bootstrap_inner",
+    "_stop", "_delete", "_wait_for_tstate_lock", "_reset_internal_locks",
+    "_set_ident", "_set_native_id", "_set_tstate_lock",
+    "start", "join", "is_alive", "name", "ident", "daemon", "native_id",
+    "getName", "setName", "isDaemon", "setDaemon",
+}
+INTENTIONAL_OVERRIDES = {"run"}     # every worker legitimately defines run()
+
+for thread_class in (vision.GeminiWorker, BeepController, UltrasonicMonitor):
+    ours = set()
+    for klass in thread_class.__mro__:
+        if klass is threading.Thread:
+            break
+        ours |= set(vars(klass))
+    clashes = sorted((ours & THREAD_INTERNALS) - INTENTIONAL_OVERRIDES)
+    check("{} defines no name Thread uses internally".format(
+        thread_class.__name__), clashes, [])
+
+# And prove the mechanism still works the way we think it does, so this test
+# keeps its meaning if CPython changes again.
+_probe = threading.Thread(target=lambda: None)
+_probe.start()
+_probe.join()
+_os_handle = getattr(_probe, "_handle", None) or getattr(
+    _probe, "_os_thread_handle", None)
+if _os_handle is not None:
+    check("a Thread's OS handle is genuinely not callable",
+          callable(_os_handle), False)
+else:
+    print("  [PASS] this Python exposes no OS thread handle attribute")
+
+# The worker's real entry point must be callable on a STARTED thread - the
+# exact condition the original bug broke.
+_started = vision.GeminiWorker()
+_started._encode_jpeg = staticmethod(lambda frame: b"fake-jpeg")
+_started._call_gemini = lambda jpeg, distance: "Wall ahead."
+_started.start()
+try:
+    _started._process_request(
+        vision.AiRequest(FakeFrame(), 80.0, time.monotonic()))
+    check("_process_request works on a running thread",
+          _started.snapshot()["description"], "Wall ahead.")
+finally:
+    _started.stop()
 
 
 # ==========================================================================

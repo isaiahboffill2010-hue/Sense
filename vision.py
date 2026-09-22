@@ -440,15 +440,30 @@ class GeminiWorker(threading.Thread):
             # A blanket guard: this thread must survive absolutely anything,
             # because the alternative is Gemini failing silently forever.
             try:
-                self._handle(request)
+                self._process_request(request)
             except Exception as exc:
                 self._record_error("{}: {}".format(type(exc).__name__, exc))
             finally:
                 with self._lock:
                     self._busy = False
 
-    def _handle(self, request):
-        """Encode, ask Gemini, and publish - or record why we could not."""
+    def _process_request(self, request):
+        """Encode, ask Gemini, and publish - or record why we could not.
+
+        DO NOT rename this back to `_handle`. This class subclasses
+        threading.Thread, and CPython 3.13's Thread.start() assigns an
+        instance attribute called `_handle` holding a _thread._ThreadHandle.
+        An instance attribute shadows a class method, so a method named
+        `_handle` here silently becomes unreachable once the thread starts,
+        and calling it raises:
+
+            TypeError: '_thread._ThreadHandle' object is not callable
+
+        Python 3.12 has no such attribute and 3.14 renamed it to
+        `_os_thread_handle`, so the bug appears only on 3.13 - which is what
+        Raspberry Pi OS ships. test_alerts.py has a guard that fails if any
+        of our thread classes reintroduce a name Thread uses internally.
+        """
         with self._lock:
             self._busy = True
 
