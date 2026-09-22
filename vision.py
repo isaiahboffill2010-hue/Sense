@@ -100,6 +100,13 @@ def load_env_file(path=None, environ=None):
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
 
+        # Credentials never contain whitespace, and this file only ever holds
+        # the API key. Removing any internal whitespace defends against a key
+        # that was pasted with a line wrap or carried a stray carriage return
+        # over from a Windows editor - both of which would otherwise be sent
+        # verbatim and rejected as malformed.
+        value = "".join(value.split())
+
         if key and key not in environ:
             environ[key] = value
             loaded.append(key)
@@ -111,6 +118,34 @@ def api_key_is_present(environ=None):
     """True if the Gemini API key is set. Never reveals the value."""
     environ = os.environ if environ is None else environ
     return bool(environ.get(config.GEMINI_API_KEY_ENV, "").strip())
+
+
+def key_fingerprint(environ=None):
+    """Describe the key's SHAPE for diagnostics. Never reveals the value.
+
+    Google AI Studio now issues "authorization keys" beginning with `AQ.`,
+    replacing the legacy `AIza` API keys. Both are sent the same way - in
+    the `x-goog-api-key` header - but a key that is truncated or in an
+    unexpected format fails with errors that look like an auth-method
+    problem, so it is worth being able to see the shape at a glance.
+
+    Documented format: AQ. followed by 40 or more URL-safe characters.
+    """
+    environ = os.environ if environ is None else environ
+    key = environ.get(config.GEMINI_API_KEY_ENV, "").strip()
+    if not key:
+        return "not set"
+
+    if key.startswith("AQ."):
+        shape = "AQ. authorization key"
+        if len(key) < 43:
+            shape += " (SHORTER than the documented minimum - truncated?)"
+    elif key.startswith("AIza"):
+        shape = "AIza legacy API key"
+    else:
+        shape = "unrecognised format"
+
+    return "{}, {} chars".format(shape, len(key))
 
 
 def _redact(text, secret):
@@ -212,6 +247,15 @@ class GeminiWorker(threading.Thread):
         authenticate with OAuth and reject API keys outright, and the flag
         that selects them has been renamed across SDK releases - so we pass
         whichever name this installed build actually accepts.
+
+        A note on `AQ.` keys, so nobody "fixes" this the wrong way later:
+        Google AI Studio now issues authorization keys beginning with `AQ.`
+        in place of the legacy `AIza` keys. They are NOT OAuth tokens and
+        must NOT be sent as `Authorization: Bearer`. They travel in exactly
+        the same `x-goog-api-key` header as the old keys, which is what
+        passing `api_key=` here does. Sending an `AQ.` key as a bearer token
+        is a known failure mode that produces misleading 400/401 errors, so
+        switching this to Bearer would make things worse, not better.
         """
         import inspect
 
@@ -276,7 +320,8 @@ class GeminiWorker(threading.Thread):
         else:
             backend = "Developer API"
 
-        detail = ", ".join([backend, timeout_note])
+        detail = ", ".join([backend, "x-goog-api-key", key_fingerprint(),
+                            timeout_note])
         if pinned:
             detail += ", pinned via {}=False".format("/".join(pinned))
 

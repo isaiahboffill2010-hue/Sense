@@ -20,7 +20,9 @@ the staleness rules and the failure handling with the API call stubbed out.
 """
 
 import os
+import pathlib
 import sys
+import tempfile
 import threading
 import time
 
@@ -508,6 +510,54 @@ check("secrets are redacted from error text",
       vision._redact("boom sk-abc123 boom", "sk-abc123"), "boom <redacted> boom")
 check("redaction copes with no secret",
       vision._redact("plain message", ""), "plain message")
+
+
+# ==========================================================================
+print("\nAQ. authorization keys are recognised and never echoed")
+# ==========================================================================
+# Google AI Studio now issues "AQ." authorization keys in place of the legacy
+# "AIza" API keys. Documented format: AQ. plus 40+ URL-safe characters. Both
+# travel in the same x-goog-api-key header - AQ. keys are NOT OAuth tokens.
+
+check("an AQ. key is recognised",
+      vision.key_fingerprint(environ={"GEMINI_API_KEY": "AQ." + "A" * 50}),
+      "AQ. authorization key, 53 chars")
+check("a short AQ. key is flagged as possibly truncated",
+      "truncated" in vision.key_fingerprint(
+          environ={"GEMINI_API_KEY": "AQ." + "A" * 20}), True)
+check("a legacy AIza key is recognised",
+      vision.key_fingerprint(environ={"GEMINI_API_KEY": "AIza" + "B" * 35}),
+      "AIza legacy API key, 39 chars")
+check("an unrecognised format says so",
+      vision.key_fingerprint(environ={"GEMINI_API_KEY": "hello"}),
+      "unrecognised format, 5 chars")
+check("an unset key says so",
+      vision.key_fingerprint(environ={}), "not set")
+check("the fingerprint never contains the key itself",
+      "A" * 50 in vision.key_fingerprint(
+          environ={"GEMINI_API_KEY": "AQ." + "A" * 50}), False)
+
+# A key pasted with a line wrap or carried over from a Windows editor must
+# not be sent verbatim - that looks like a bad key when it is only mangled.
+_tmp = pathlib.Path(tempfile.gettempdir()) / "sense_key_sanitise.env"
+for label, written, expected in [
+    ("trailing CRLF", "GEMINI_API_KEY=AQ.abcdef\r\n", "AQ.abcdef"),
+    ("surrounding quotes", 'GEMINI_API_KEY="AQ.abcdef"\n', "AQ.abcdef"),
+    ("stray inner spaces", "GEMINI_API_KEY=AQ. abc def\n", "AQ.abcdef"),
+    ("leading whitespace", "GEMINI_API_KEY=   AQ.abcdef\n", "AQ.abcdef"),
+]:
+    _tmp.write_text(written, encoding="utf-8")
+    env = {}
+    vision.load_env_file(path=_tmp, environ=env)
+    check("sanitised: {}".format(label), env.get("GEMINI_API_KEY"), expected)
+_tmp.unlink()
+
+# And the real key on this machine must be well formed.
+_real = {}
+vision.load_env_file(path=config.ENV_FILE_PATH, environ=_real)
+_real_key = _real.get("GEMINI_API_KEY", "")
+check("the project's own key parses as a valid AQ. key",
+      _real_key.startswith("AQ.") and len(_real_key) >= 43, True)
 
 
 # ==========================================================================

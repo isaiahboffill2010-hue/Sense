@@ -28,16 +28,66 @@ This makes ONE API call. At current gemini-3.5-flash-lite prices that is
 roughly $0.0001.
 """
 
+import os
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import config
 import vision
+
+MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 def step(number, title):
     print("")
     print("[{}] {}".format(number, title))
+
+
+def probe_transports(api_key):
+    """Ask the API directly which credential transport it accepts.
+
+    Uses urllib rather than a shell curl on purpose: a shell command
+    substitution can mangle a key with a stray carriage return or an
+    awkward character and produce a misleading "invalid key" result.
+    Nothing here goes through google-genai either, so this separates an
+    SDK problem from a key or account problem.
+    """
+    attempts = [
+        ("x-goog-api-key header  (correct for AQ. and AIza keys)",
+         MODELS_URL, {"x-goog-api-key": api_key}),
+        ("?key= query parameter  (also supported)",
+         MODELS_URL + "?" + urllib.parse.urlencode({"key": api_key}), {}),
+        ("Authorization: Bearer  (expected to FAIL - not an OAuth token)",
+         MODELS_URL, {"Authorization": "Bearer " + api_key}),
+    ]
+
+    print("    Probing the native Gemini endpoint directly:")
+    for label, url, headers in attempts:
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                print("      {:<58} HTTP {}".format(label, response.status))
+        except urllib.error.HTTPError as exc:
+            body = vision._redact(
+                exc.read().decode("utf-8", "replace"), api_key)
+            detail = " ".join(body.split())[:150]
+            print("      {:<58} HTTP {}".format(label, exc.code))
+            print("          {}".format(detail))
+        except Exception as exc:
+            print("      {:<58} {}: {}".format(
+                label, type(exc).__name__, vision._redact(exc, api_key)))
+
+    print("")
+    print("    How to read this:")
+    print("      header or query returns 200  -> the key is fine; the fault")
+    print("                                      is in the SDK layer")
+    print("      both return 400/401/403      -> the key or the account is")
+    print("                                      the problem, not our code")
+    print("      only Bearer differs          -> expected; AQ. keys are not")
+    print("                                      OAuth tokens")
 
 
 def fail(message, hint=None):
@@ -74,6 +124,7 @@ if not vision.api_key_is_present():
         """,
     )
 print("    {} is set (value not shown)".format(config.GEMINI_API_KEY_ENV))
+print("    shape: {}".format(vision.key_fingerprint()))
 
 # -------------------------------------------------------------------------
 step(2, "google-genai package")
@@ -149,12 +200,17 @@ try:
     raw = worker._call_gemini(jpeg_bytes, 80.0)
 except Exception as exc:
     elapsed = time.monotonic() - started
+    api_key = os.environ.get(config.GEMINI_API_KEY_ENV, "").strip()
+    print("    FAILED after {:.1f}s: {}: {}".format(
+        elapsed, type(exc).__name__, vision._redact(exc, api_key)))
+    print("")
+    print("[5b] auth transport diagnosis")
+    probe_transports(api_key)
     fail(
-        "{}: {}  (after {:.1f}s)".format(type(exc).__name__, exc, elapsed),
+        "the Gemini call did not succeed",
         """
-        Common causes:
-          - no internet          check with:  ping -c1 generativelanguage.googleapis.com
-          - bad or expired key   regenerate at https://aistudio.google.com/apikey
+        Other things to rule out:
+          - no internet          ping -c1 generativelanguage.googleapis.com
           - model name wrong     check GEMINI_MODEL in config.py
           - SDK surface changed  fix GeminiWorker._call_gemini() in vision.py
         """,
