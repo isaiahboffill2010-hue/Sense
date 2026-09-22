@@ -1878,6 +1878,11 @@ check("--headless is a real flag",
       app.parse_args(["--headless"]).headless, True)
 
 service = pathlib.Path("deploy/sense.service").read_text(encoding="utf-8")
+# Directives only - comments in the unit file legitimately MENTION things
+# the unit must not actually depend on.
+directives = "\n".join(
+    line for line in service.splitlines()
+    if line.strip() and not line.strip().startswith("#"))
 check("the unit runs Sense headless", "--headless" in service, True)
 check("the unit provides AUDIO_DEVICE",
       "Environment=AUDIO_DEVICE=plughw:1,0" in service, True)
@@ -1898,12 +1903,17 @@ check("and allows time for that cleanup",
       "TimeoutStopSec=20" in service, True)
 check("the unit starts WITHOUT a graphical session",
       "WantedBy=multi-user.target" in service, True)
-check("and never requires graphical.target",
-      "graphical.target" in service, False)
+check("and no directive requires graphical.target",
+      "graphical.target" in directives, False)
+check("nor a display or X server",
+      any(word in directives for word in ("DISPLAY", "xorg", "wayland")),
+      False)
 check("the unit waits for the network for Gemini",
       "network-online.target" in service, True)
 check("the API key is NOT in the unit file",
-      "GEMINI_API_KEY" in service, False)
+      "GEMINI_API_KEY" in directives, False)
+check("no secret-looking value is embedded",
+      "AQ." in directives or "AIza" in directives, False)
 check("the key still comes from .env.local",
       ".env.local" in service, True)
 
