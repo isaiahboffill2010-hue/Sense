@@ -35,8 +35,10 @@ down and cleaned up in a finally block either way.
 
 import argparse
 import collections
+import os
 import signal
 import sys
+import threading
 import time
 
 import alerts
@@ -45,6 +47,11 @@ import diagnostics
 # Tone name constant only; hardware.audio imports no audio library at
 # module level, so this is still safe to import on a non-Pi machine.
 from hardware.audio import TONE_WARNING
+
+# Everything the SIGUSR1 dump needs. Populated by main(); read by the
+# signal handler. A plain dict so the handler can never fail on a missing
+# attribute.
+RUNTIME = {}
 
 # Subsystem status words shown in the overlay and the startup report.
 STATUS_OK = "OK"
@@ -77,6 +84,117 @@ STATE_COLORS = {
 # ==========================================================================
 # Command line
 # ==========================================================================
+def dump_state(reason="requested"):
+    """Print everything about the running system, right now.
+
+    Sent to the log on SIGUSR1 so the SAME running service can be compared
+    before and after an external change - plugging in HDMI, for instance:
+
+        sudo systemctl kill -s USR1 sense     # before
+        # plug the cable in
+        sudo systemctl kill -s USR1 sense     # after
+        journalctl -u sense -n 120
+
+    Deliberately defensive: a diagnostic that crashes the program it is
+    diagnosing is worse than useless.
+    """
+    lines = []
+
+    def add(label, value):
+        lines.append("  {:<26} {}".format(label, value))
+
+    try:
+        add("reason", reason)
+        add("uptime of process", "{:.1f} s".format(
+            time.monotonic() - RUNTIME.get("started_at", time.monotonic())))
+        add("python", sys.version.split()[0])
+        add("pid", os.getpid())
+        add("GIL switch interval", sys.getswitchinterval())
+        add("threads alive", ", ".join(sorted(
+            t.name for t in threading.enumerate())))
+
+        # --- ultrasonic -------------------------------------------------
+        monitor = RUNTIME.get("monitor")
+        sensor = RUNTIME.get("sensor")
+        if sensor is not None:
+            add("ultrasonic ports", sensor.description)
+            add("resolved GPIO", getattr(sensor, "resolved_bcm", "unknown"))
+        if monitor is not None:
+            add("ultrasonic thread alive", monitor.is_alive())
+            snap = monitor.snapshot()
+            add("distance_cm", snap["distance_cm"])
+            add("out of range", snap["out_of_range"])
+            add("readings taken", snap["reading_count"])
+            add("healthy", snap["healthy"])
+            add("last error", snap["error"])
+        else:
+            add("ultrasonic", "not running")
+
+        # --- camera -----------------------------------------------------
+        reader = RUNTIME.get("reader")
+        if reader is not None:
+            cam = reader.snapshot()
+            add("camera thread alive", cam["alive"])
+            add("frames captured", cam["frame_count"])
+            add("camera fps", "{:.1f}".format(cam["fps"])
+                if cam["fps"] else "n/a")
+            add("newest frame age", "{:.2f} s".format(cam["age_s"])
+                if cam["age_s"] is not None else "NO FRAME EVER")
+            add("camera stalled", cam["stalled"])
+            add("quiet for", "{:.1f} s".format(cam["quiet_for_s"]))
+            add("camera errors", cam["error_count"])
+            add("camera last error", cam["error"])
+        else:
+            add("camera", "not running")
+
+        # --- alert / audio ----------------------------------------------
+        policy = RUNTIME.get("policy")
+        if policy is not None:
+            add("alert status", policy.status)
+        beeper = RUNTIME.get("beeper")
+        if beeper is not None:
+            add("beeper thread alive", beeper.is_alive())
+            add("beeps played", beeper.beep_count)
+            add("beeper error", beeper.error)
+        speech = RUNTIME.get("speech")
+        if speech is not None:
+            add("speech thread alive", speech.is_alive())
+            add("speech spoken", speech.spoken_count)
+            add("speech suppressed", speech.suppressed_count)
+            add("speech error", speech.error)
+        add("audio device", config.AUDIO_DEVICE or "system default")
+
+        # --- gemini -----------------------------------------------------
+        vision = RUNTIME.get("vision")
+        if vision is not None:
+            ai = vision.snapshot()
+            add("gemini thread alive", vision.is_alive())
+            add("gemini state", ai["state"])
+            add("gemini requests/ok", "{} / {}".format(
+                ai["request_count"], ai["reply_count"]))
+            add("gemini last api", "{:.0f} ms".format(ai["api_ms"])
+                if ai["api_ms"] else "n/a")
+            add("gemini description", ai["accepted_text"])
+
+        # --- main loop --------------------------------------------------
+        add("main loop iterations", RUNTIME.get("iterations"))
+        last_tick = RUNTIME.get("last_tick")
+        if last_tick is not None:
+            add("main loop last ran", "{:.2f} s ago".format(
+                time.monotonic() - last_tick))
+    except Exception as exc:
+        lines.append("  DUMP ERROR: {}: {}".format(type(exc).__name__, exc))
+
+    print("")
+    print("=" * 62)
+    print("  SENSE STATE DUMP")
+    print("=" * 62)
+    for line in lines:
+        print(line)
+    print("=" * 62)
+    print("", flush=True)
+
+
 def install_signal_handlers():
     """Make SIGTERM shut down as cleanly as Ctrl+C does.
 
@@ -111,6 +229,15 @@ def install_signal_handlers():
             signal.signal(sig, handle)
         except (ValueError, OSError, RuntimeError):
             # Not the main thread, or unsupported on this platform.
+            pass
+
+    # SIGUSR1 dumps state instead of stopping. This is what makes a
+    # before/after comparison possible on one running service.
+    usr1 = getattr(signal, "SIGUSR1", None)
+    if usr1 is not None:
+        try:
+            signal.signal(usr1, lambda _s, _f: dump_state("SIGUSR1"))
+        except (ValueError, OSError, RuntimeError):
             pass
 
 
@@ -581,7 +708,7 @@ def update_states_from_monitor(states, monitor):
         states["Ultrasonic"] = (STATUS_OK, "recovered")
 
 
-def run_preview_loop(camera, monitor, beeper, states, policy, vision=None,
+def run_preview_loop(reader, monitor, beeper, states, policy, vision=None,
                      speech=None):
     """Live OpenCV preview. Returns True if it ran, False to fall back."""
     import cv2
@@ -603,16 +730,19 @@ def run_preview_loop(camera, monitor, beeper, states, policy, vision=None,
     print("Live preview running. Press Q in the window to quit.")
     print("")
 
-    fps = FpsMeter()
     spoken_generation = 0
+    iterations = 0
     while True:
-        try:
-            frame = camera.read()
-        except CameraError as exc:
-            print("CAMERA ERROR: {}".format(exc))
-            break
+        iterations += 1
+        RUNTIME["iterations"] = iterations
+        RUNTIME["last_tick"] = time.monotonic()
 
-        fps.tick()
+        # Newest frame, WITHOUT waiting for one. The capture thread owns
+        # the blocking call now, so a stalled camera costs us the picture
+        # and nothing else - the ultrasonic reading and the beeps below
+        # keep going regardless.
+        frame, _frame_age = reader.latest()
+        reader.report_stall_once()
 
         snapshot = monitor.snapshot() if monitor is not None else None
 
@@ -625,10 +755,20 @@ def run_preview_loop(camera, monitor, beeper, states, policy, vision=None,
 
         audio_error = beeper.error if beeper is not None else None
         ai = vision.snapshot() if vision is not None else None
+
+        if frame is None:
+            # No frame yet, or the camera has stalled. Everything else is
+            # still running, so just wait for one rather than exiting.
+            if cv2.waitKey(50) & 0xFF in (ord("q"), ord("Q"), 27):
+                print("Q pressed - shutting down...")
+                break
+            continue
+
+        camera_state = reader.snapshot()
         ui.draw_hud(
             frame,
             build_hud_lines(snapshot, status, states, audio_error, ai),
-            fps=fps.value,
+            fps=camera_state["fps"],
         )
 
         cv2.imshow(config.WINDOW_NAME, frame)
@@ -654,31 +794,30 @@ def run_preview_loop(camera, monitor, beeper, states, policy, vision=None,
     return True
 
 
-def run_headless_loop(camera, monitor, beeper, states, policy, vision=None,
+def run_headless_loop(reader, monitor, beeper, states, policy, vision=None,
                       speech=None):
     """No window: print the same information to the terminal."""
     print("")
     print("Headless mode. Press Ctrl+C to quit.")
     print("")
 
-    camera_error_reported = False
-    fps = FpsMeter()
     next_print = 0.0
     spoken_generation = 0
+    iterations = 0
 
     while True:
+        iterations += 1
+        RUNTIME["iterations"] = iterations
+        RUNTIME["last_tick"] = time.monotonic()
+
+        # Newest frame, WITHOUT waiting for one. This is the whole point:
+        # the ultrasonic reading and the beep decision below must never sit
+        # downstream of a blocking camera call.
         frame = None
-        if camera is not None:
-            from hardware.camera import CameraError
-            try:
-                # Keep the frame: Gemini needs it, even with no window.
-                frame = camera.read()
-                fps.tick()
-            except CameraError as exc:
-                if not camera_error_reported:
-                    print("CAMERA ERROR: {}".format(exc))
-                    camera_error_reported = True
-                    states["Camera"] = (STATUS_FAIL, str(exc))
+        if reader is not None:
+            frame = reader.fresh_frame()
+            if reader.report_stall_once():
+                states["Camera"] = (STATUS_FAIL, "no frames")
 
         snapshot = monitor.snapshot() if monitor is not None else None
         status = apply_alert_policy(
@@ -689,7 +828,13 @@ def run_headless_loop(camera, monitor, beeper, states, policy, vision=None,
         now = time.monotonic()
         if now >= next_print:
             next_print = now + 0.5
-            fps_text = "" if fps.value is None else "  fps {:.1f}".format(fps.value)
+            camera_state = reader.snapshot() if reader is not None else None
+            fps_text = ""
+            if camera_state and camera_state["fps"]:
+                fps_text = "  fps {:.1f}".format(camera_state["fps"])
+            elif camera_state and camera_state["stalled"]:
+                fps_text = "  CAMERA STALLED {:.0f}s".format(
+                    camera_state["quiet_for_s"])
             print("{:<34} Status: {:<8} Cam {:<3} US {:<3} Aud {}{}".format(
                 format_distance(snapshot),
                 status,
@@ -711,8 +856,11 @@ def run_headless_loop(camera, monitor, beeper, states, policy, vision=None,
         # cv2.waitKey(1); without it here the main loop spins flat out and
         # starves the ultrasonic pulse-timing thread of the GIL, which
         # corrupts the distance reading rather than merely slowing it.
-        # Longer pause when there is no camera to pace us at all.
-        time.sleep(0.05 if camera is None else config.HEADLESS_LOOP_YIELD_S)
+        #
+        # The camera no longer paces this loop at all - capture happens on
+        # its own thread - so this sleep is now the ONLY thing setting the
+        # loop rate. It has to stay.
+        time.sleep(config.HEADLESS_LOOP_YIELD_S)
 
     return True
 
@@ -727,7 +875,7 @@ def _short_state(state):
 # Shutdown
 # ==========================================================================
 def shutdown(camera, sensor, monitor, player, beeper, vision=None,
-             speech=None, speech_player=None):
+             speech=None, speech_player=None, reader=None):
     """Stop everything, in the safe order, and never raise while doing it."""
     print("")
     print("Cleaning up...")
@@ -764,6 +912,12 @@ def shutdown(camera, sensor, monitor, player, beeper, vision=None,
     if player is not None:
         player.close()
         print("  audio closed")
+
+    if reader is not None:
+        # capture_array() cannot be interrupted, so this may return with the
+        # thread still wedged. It is a daemon, so that cannot delay exit.
+        reader.stop()
+        print("  camera thread stopped")
 
     if camera is not None:
         camera.close()
@@ -816,6 +970,7 @@ def main(argv=None):
     }
 
     camera = None
+    reader = None
     sensor = None
     monitor = None
     player = None
@@ -864,24 +1019,38 @@ def main(argv=None):
             print("unavailable or skipped. Fix the items above and try again.")
             return 1
 
+        # Capture on its own thread, so the beeps can never sit behind a
+        # blocking camera call.
+        reader = None
+        if camera is not None:
+            from hardware.camera import CameraReader
+            reader = CameraReader(camera)
+            reader.start()
+
         # One policy shared by both loops: it owns all the alert state.
         policy = alerts.AlertPolicy()
+
+        RUNTIME.update({
+            "started_at": time.monotonic(), "sensor": sensor,
+            "monitor": monitor, "reader": reader, "policy": policy,
+            "beeper": beeper, "speech": speech, "vision": vision,
+        })
 
         ran_preview = False
         if camera is not None and not args.headless:
             ran_preview = run_preview_loop(
-                camera, monitor, beeper, states, policy, vision, speech
+                reader, monitor, beeper, states, policy, vision, speech
             )
         if not ran_preview:
             run_headless_loop(
-                camera, monitor, beeper, states, policy, vision, speech)
+                reader, monitor, beeper, states, policy, vision, speech)
 
     except KeyboardInterrupt:
         print("")
         print("Ctrl+C received - shutting down...")
     finally:
         shutdown(camera, sensor, monitor, player, beeper, vision,
-                 speech, speech_player)
+                 speech, speech_player, reader)
 
     return exit_code
 

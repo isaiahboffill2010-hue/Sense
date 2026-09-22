@@ -29,6 +29,7 @@ import time
 import alerts
 import config
 import vision
+import _thread
 import contextlib
 import inspect
 import io
@@ -36,6 +37,7 @@ import subprocess
 
 import main as app
 import hardware.audio as audio_module
+from hardware.camera import CameraReader
 from hardware.audio import (
     TONE_DANGER,
     TONE_WARNING,
@@ -2178,6 +2180,207 @@ check("the danger beep interval is unchanged",
       config.BEEP_INTERVAL_DANGER_S, 0.15)
 check("DANGER still never mutes speech",
       hasattr(config, "SPEECH_MUTE_IN_DANGER"), False)
+
+
+# ==========================================================================
+print("\nA stalled camera cannot freeze the ultrasonic warning path")
+# ==========================================================================
+# This section exists because of a real bug. picam2.capture_array() BLOCKS
+# until a frame arrives, and it used to be the first statement in the main
+# loop - with monitor.snapshot() and the beep decision AFTER it. So a camera
+# that never delivered a frame froze the whole warning path, even though the
+# ultrasonic thread was measuring perfectly well the entire time.
+#
+# The startup beep and "Sense ready." both happen BEFORE the loop, which is
+# why they were heard while nothing else responded.
+#
+# Capture now runs on its own thread; the loop takes the newest frame and
+# never waits for one.
+
+
+class _HangingCamera:
+    """capture_array() that never returns."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def read(self):
+        self.calls += 1
+        while True:
+            time.sleep(0.02)
+
+    def close(self):
+        pass
+
+
+class _GoodCamera:
+    def __init__(self):
+        self.calls = 0
+
+    def read(self):
+        self.calls += 1
+        time.sleep(0.02)
+        return object()
+
+    def close(self):
+        pass
+
+
+class _StallBeeper:
+    error = None
+    beep_count = 0
+
+    def __init__(self):
+        self.intervals = []
+
+    def set_interval(self, interval):
+        self.intervals.append(interval)
+
+    def play_once(self, tone):
+        pass
+
+    def stop(self):
+        pass
+
+    def is_alive(self):
+        return True
+
+
+class _StallMonitor:
+    def __init__(self):
+        self.polls = 0
+
+    def snapshot(self):
+        self.polls += 1
+        return {"distance_cm": 12.0, "out_of_range": False, "error": None,
+                "healthy": True, "reading_count": self.polls}
+
+    def stop(self):
+        pass
+
+    def is_alive(self):
+        return True
+
+
+_STALL_STATES = {k: ("OK", "") for k in
+                 ("Camera", "Ultrasonic", "Audio", "Gemini", "Speech")}
+
+
+def _run_loop_briefly(camera, seconds=0.8):
+    reader = CameraReader(camera)
+    reader.start()
+    beeper = _StallBeeper()
+    monitor = _StallMonitor()
+
+    def interrupt():
+        time.sleep(seconds)
+        _thread.interrupt_main()
+
+    threading.Thread(target=interrupt, daemon=True).start()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            app.run_headless_loop(reader, monitor, beeper,
+                                  dict(_STALL_STATES),
+                                  alerts.AlertPolicy(), None, None)
+    except KeyboardInterrupt:
+        pass
+    reader.stop(timeout=0.2)
+    return beeper, monitor, reader, captured.getvalue()
+
+
+_saved_warn = config.CAMERA_STALL_WARN_S
+try:
+    config.CAMERA_STALL_WARN_S = 0.2
+    beeper, monitor, reader, logged = _run_loop_briefly(_HangingCamera())
+    state = reader.snapshot()
+
+    check("the camera really did deliver nothing", state["frame_count"], 0)
+    check("and is reported as stalled", state["stalled"], True)
+    check("with a loud, unmistakable log line",
+          "CAMERA STALLED" in logged, True)
+    check("that says the safety path is unaffected",
+          "UNAFFECTED" in logged, True)
+
+    # The whole point:
+    check("the ultrasonic sensor is still being polled",
+          monitor.polls > 10, True)
+    check("the beep interval is still being set",
+          len(beeper.intervals) > 10, True)
+    check("and DANGER beeps are STILL scheduled with a dead camera",
+          any(i is not None for i in beeper.intervals), True)
+    check("at the correct urgent interval",
+          config.BEEP_INTERVAL_DANGER_S in beeper.intervals, True)
+finally:
+    config.CAMERA_STALL_WARN_S = _saved_warn
+
+# A healthy camera must still deliver frames through the same path.
+beeper, monitor, reader, _logged = _run_loop_briefly(_GoodCamera())
+state = reader.snapshot()
+check("a working camera still delivers frames", state["frame_count"] > 3, True)
+check("is not reported as stalled", state["stalled"], False)
+check("reports a frame rate", state["fps"] is not None, True)
+check("and the beeps work as well",
+      any(i is not None for i in beeper.intervals), True)
+
+# latest() and fresh_frame() must never block or raise.
+empty = CameraReader(_GoodCamera())
+frame, age = empty.latest()
+check("latest() on an unstarted reader returns nothing, safely",
+      (frame, age), (None, None))
+check("fresh_frame() likewise", empty.fresh_frame(), None)
+check("snapshot() works before the thread starts",
+      empty.snapshot()["frame_count"], 0)
+
+# The reader must be a daemon: capture_array() cannot be interrupted, so a
+# wedged camera must never be able to hold up shutdown.
+check("the capture thread is a daemon", CameraReader(_GoodCamera()).daemon,
+      True)
+check("and its name does not clash with threading.Thread internals",
+      "camera" in [t.name for t in [CameraReader(_GoodCamera())]], True)
+
+
+# ==========================================================================
+print("\nSIGUSR1 dumps the state needed to compare before/after HDMI")
+# ==========================================================================
+check("a state dump function exists", callable(app.dump_state), True)
+
+app.RUNTIME.clear()
+logged = io.StringIO()
+with contextlib.redirect_stdout(logged):
+    app.dump_state("test with nothing running")
+dumped = logged.getvalue()
+check("it survives with nothing registered", "SENSE STATE DUMP" in dumped, True)
+check("and does not raise", "DUMP ERROR" in dumped, False)
+
+# With subsystems registered it must report the fields asked for.
+reader = CameraReader(_GoodCamera())
+reader.start()
+time.sleep(0.15)
+monitor = _StallMonitor()
+monitor.snapshot()
+app.RUNTIME.update({
+    "started_at": time.monotonic(), "sensor": None, "monitor": monitor,
+    "reader": reader, "policy": alerts.AlertPolicy(), "beeper": None,
+    "speech": None, "vision": None, "iterations": 42,
+    "last_tick": time.monotonic(),
+})
+logged = io.StringIO()
+with contextlib.redirect_stdout(logged):
+    app.dump_state("test")
+dumped = logged.getvalue()
+reader.stop(timeout=0.2)
+
+for field in ("distance_cm", "ultrasonic thread alive", "frames captured",
+              "camera fps", "newest frame age", "camera stalled",
+              "alert status", "audio device", "threads alive",
+              "main loop iterations", "GIL switch interval"):
+    check("the dump includes: {}".format(field), field in dumped, True)
+check("it never raises with subsystems present",
+      "DUMP ERROR" in dumped, False)
+app.RUNTIME.clear()
+
+check("the Pi-side probe script exists",
+      pathlib.Path("deploy/hdmi_probe.sh").exists(), True)
 
 
 # ==========================================================================

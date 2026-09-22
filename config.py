@@ -199,6 +199,31 @@ CAMERA_SWAP_RED_BLUE = False
 
 WINDOW_NAME = "Navigation Headband - Phase 1 Hardware Test"
 
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# THE CAMERA MUST NEVER BE ABLE TO STOP THE COLLISION WARNING
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# picam2.capture_array() BLOCKS until a frame arrives. It used to be the
+# first statement in the main loop, with the ultrasonic reading and the
+# beep decision after it - so a camera that stopped delivering frames froze
+# the warning path completely, even though the ultrasonic thread was still
+# measuring perfectly well.
+#
+# Capture now happens on its own thread and the main loop takes whatever
+# the newest frame is, without waiting. A stalled camera then costs us the
+# picture and Gemini, and nothing else.
+#
+# How long a frame may be reused before we call it stale. The HUD and
+# Gemini ignore frames older than this; the beeps do not care either way.
+CAMERA_FRAME_MAX_AGE_S = 1.0
+
+# Say so, loudly and once, if no frame arrives for this long. This is the
+# log line that identifies a camera stall instead of leaving you guessing
+# why nothing responds.
+CAMERA_STALL_WARN_S = 5.0
+
+# How long the capture thread waits before retrying after a failed read.
+CAMERA_RETRY_S = 0.5
+
 # Headless mode has no cv2.waitKey(1), which in the preview loop happens to
 # yield the GIL for about a millisecond on every frame. Without a yield the
 # main loop can spin flat out and starve the ultrasonic pulse-timing thread.
