@@ -30,6 +30,7 @@ import alerts
 import config
 import vision
 import contextlib
+import inspect
 import io
 
 import main as app
@@ -41,7 +42,7 @@ from hardware.audio import (
     SpeechController,
     _clean_for_speech,
 )
-from hardware.ultrasonic import UltrasonicMonitor
+from hardware.ultrasonic import UltrasonicError, UltrasonicMonitor, UltrasonicSensor
 
 FAILURES = []
 
@@ -1916,6 +1917,101 @@ check("no secret-looking value is embedded",
       "AQ." in directives or "AIza" in directives, False)
 check("the key still comes from .env.local",
       ".env.local" in service, True)
+
+
+# ==========================================================================
+print("\nUltrasonic pulse timing is protected from other Python threads")
+# ==========================================================================
+# robot_hat times the ECHO pulse in a pure-Python busy loop, so a stall
+# between its two samples is added straight onto the measured width - about
+# 85 cm per 5 ms GIL switch interval. A reading stuck near 184 cm is a
+# 10.8 ms pulse, roughly two switch intervals.
+#
+# Two things protect it now: the headless loop always yields (the preview
+# loop got that for free from cv2.waitKey(1)), and the switch interval is
+# raised for the duration of each ping.
+
+check("the headless loop has a configured yield",
+      config.HEADLESS_LOOP_YIELD_S > 0, True)
+check("and it is short enough not to throttle the camera",
+      config.HEADLESS_LOOP_YIELD_S <= 0.02, True)
+
+headless_src = inspect.getsource(app.run_headless_loop)
+check("the headless loop yields unconditionally, not only without a camera",
+      "if camera is None:\n            time.sleep" in headless_src, False)
+check("and it does sleep every iteration",
+      "time.sleep(" in headless_src, True)
+
+check("a ping raises the switch interval", 
+      config.SENSOR_TIMING_SWITCH_INTERVAL_S > sys.getswitchinterval(), True)
+
+
+class _SpyUltrasonic:
+    """Records the GIL switch interval in force while a ping runs."""
+
+    def __init__(self, raises=False):
+        self.seen_interval = None
+        self._raises = raises
+
+    def read(self, times=1):
+        self.seen_interval = sys.getswitchinterval()
+        if self._raises:
+            raise RuntimeError("simulated robot_hat failure")
+        return 42.0
+
+
+_before = sys.getswitchinterval()
+
+sensor = UltrasonicSensor("D0", "D1")
+spy = _SpyUltrasonic()
+sensor._ultrasonic = spy
+value = sensor.measure_once()
+
+check("the ping still returns its distance", value, 42.0)
+check("the switch interval was raised DURING the ping",
+      # setswitchinterval round-trips through a C double, so compare with a
+      # tolerance rather than for exact equality.
+      abs(spy.seen_interval - config.SENSOR_TIMING_SWITCH_INTERVAL_S) < 1e-9,
+      True)
+check("and restored afterwards", sys.getswitchinterval(), _before)
+
+# It must be restored even when the ping blows up, or one failure would
+# leave the whole process with a degraded scheduler.
+sensor = UltrasonicSensor("D0", "D1")
+sensor._ultrasonic = _SpyUltrasonic(raises=True)
+raised = None
+try:
+    sensor.measure_once()
+except UltrasonicError as exc:
+    raised = exc
+check("a failing ping still raises UltrasonicError", raised is not None, True)
+check("and the switch interval is still restored",
+      sys.getswitchinterval(), _before)
+
+# The resolved-GPIO readback, which catches robot_hat putting a port on a
+# different pin than this board expects.
+check("the pin readback helper exists",
+      callable(getattr(UltrasonicSensor, "_resolved_bcm", None)), True)
+
+
+class _FakePin:
+    def __init__(self, num):
+        self._pin_num = num
+
+
+check("it reads the BCM number back off a Pin",
+      UltrasonicSensor._resolved_bcm(_FakePin(17)), 17)
+check("and returns None when the build does not expose one",
+      UltrasonicSensor._resolved_bcm(object()), None)
+
+# The wiring itself must be untouched by any of this.
+check("TRIG is still D0", config.TRIG_PIN, "D0")
+check("ECHO is still D1", config.ECHO_PIN, "D1")
+check("D0 is still GPIO17", config.ROBOT_HAT_PIN_TO_BCM["D0"], 17)
+check("D1 is still GPIO4", config.ROBOT_HAT_PIN_TO_BCM["D1"], 4)
+
+check("the standalone diagnostic exists",
+      pathlib.Path("diagnose_ultrasonic.py").exists(), True)
 
 
 # ==========================================================================

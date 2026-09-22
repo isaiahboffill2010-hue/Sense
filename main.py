@@ -707,9 +707,12 @@ def run_headless_loop(camera, monitor, beeper, states, policy, vision=None,
             if beeper is not None and beeper.error:
                 print("   AUDIO ERROR: {}".format(beeper.error))
 
-        # Nothing to draw, so pace the loop politely instead of spinning.
-        if camera is None:
-            time.sleep(0.05)
+        # ALWAYS yield. The preview loop gets this for free from
+        # cv2.waitKey(1); without it here the main loop spins flat out and
+        # starves the ultrasonic pulse-timing thread of the GIL, which
+        # corrupts the distance reading rather than merely slowing it.
+        # Longer pause when there is no camera to pace us at all.
+        time.sleep(0.05 if camera is None else config.HEADLESS_LOOP_YIELD_S)
 
     return True
 

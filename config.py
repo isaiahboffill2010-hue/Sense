@@ -152,6 +152,34 @@ ULTRASONIC_TIMEOUT_S = 0.030
 # project must not produce, so we reject it as a fault instead.
 SENSOR_IMPLAUSIBLE_ABOVE_CM = 600.0
 
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PROTECTING THE PULSE TIMING FROM THE REST OF PYTHON
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# robot_hat times the ECHO pulse in a pure-Python busy loop:
+#
+#     while self.echo.value() == 0: pulse_start = time.time()
+#     while self.echo.value() == 1: pulse_end   = time.time()
+#
+# That is exquisitely sensitive to the GIL. Python hands the GIL to another
+# thread every sys.getswitchinterval() seconds (5 ms by default), so if this
+# thread is preempted in the middle of a pulse, the measured width is
+# inflated by whole multiples of that interval - roughly 85 cm per 5 ms.
+#
+# A stuck reading near 184 cm is 10.8 ms, almost exactly TWO switch
+# intervals, which is the signature of exactly that preemption.
+#
+# While a ping is in flight we raise the switch interval so the timing loop
+# keeps the GIL for the whole pulse. A ping lasts at most
+# ULTRASONIC_TIMEOUT_S (30 ms), so nothing else is held up for long, and the
+# camera and audio threads spend their time blocked in C calls anyway.
+# Set to 0 to disable and use Python's default.
+SENSOR_TIMING_SWITCH_INTERVAL_S = 0.05
+
+# Log the raw value robot_hat returned for every ping, plus the resolved
+# GPIO numbers at startup. Invaluable when readings look wrong, noisy in
+# normal use - leave False unless diagnosing.
+SENSOR_LOG_RAW_PINGS = False
+
 
 # ==========================================================================
 # 4. CAMERA
@@ -170,6 +198,13 @@ CAMERA_FORMAT = "RGB888"
 CAMERA_SWAP_RED_BLUE = False
 
 WINDOW_NAME = "Navigation Headband - Phase 1 Hardware Test"
+
+# Headless mode has no cv2.waitKey(1), which in the preview loop happens to
+# yield the GIL for about a millisecond on every frame. Without a yield the
+# main loop can spin flat out and starve the ultrasonic pulse-timing thread.
+# This is the headless loop's explicit equivalent. At 5 ms it caps the loop
+# at 200 Hz, far above any camera frame rate, so it costs nothing.
+HEADLESS_LOOP_YIELD_S = 0.005
 
 
 # ==========================================================================

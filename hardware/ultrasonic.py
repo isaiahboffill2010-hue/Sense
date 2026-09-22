@@ -40,6 +40,7 @@ This module never invents a reading. If no echo comes back you get an
 UltrasonicError saying so - not a number.
 """
 
+import sys
 import threading
 import time
 
@@ -142,8 +143,42 @@ class UltrasonicSensor:
                 .format(type(exc).__name__, exc)
             ) from exc
 
+        # Report the pins robot_hat actually resolved. robot_hat carries more
+        # than one port->GPIO table and picks between them by detected board
+        # type, so "D0"/"D1" are not guaranteed to land where we expect. A
+        # mismatch here would mean ECHO is being read from a floating pin,
+        # which looks exactly like a sensor that never responds.
+        self.resolved_bcm = {
+            "TRIG": self._resolved_bcm(trig),
+            "ECHO": self._resolved_bcm(echo),
+        }
+        for label, port in (("TRIG", self.trig_pin), ("ECHO", self.echo_pin)):
+            expected = config.ROBOT_HAT_PIN_TO_BCM.get(port)
+            actual = self.resolved_bcm[label]
+            if expected is not None and actual is not None and actual != expected:
+                print(
+                    "ULTRASONIC WARNING: robot_hat resolved {} {} to GPIO{}, "
+                    "but this board should use GPIO{}. ECHO on the wrong pin "
+                    "reads as a floating input and never responds."
+                    .format(label, port, actual, expected),
+                    flush=True,
+                )
+
         time.sleep(0.05)      # let the module settle after being claimed
         return self
+
+    @staticmethod
+    def _resolved_bcm(pin_object):
+        """The BCM number a robot_hat Pin actually ended up on, or None.
+
+        The attribute name has moved around between robot_hat releases, so
+        try the known ones rather than depending on any single version.
+        """
+        for attribute in ("_pin_num", "pin_num", "_pin", "pin"):
+            value = getattr(pin_object, attribute, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        return None
 
     # ---------------------------------------------------------- measurement
     def measure_once(self):
@@ -154,6 +189,16 @@ class UltrasonicSensor:
         if self._ultrasonic is None:
             raise UltrasonicError("Sensor is not open. Call open() first.")
 
+        # Hold the GIL for the duration of the ping. robot_hat measures the
+        # echo pulse with a pure-Python busy loop, so being preempted
+        # mid-pulse inflates the reading by ~85 cm per 5 ms switch interval.
+        # This is what stops a busy main loop from corrupting the distance.
+        interval = config.SENSOR_TIMING_SWITCH_INTERVAL_S
+        previous = sys.getswitchinterval() if interval > 0 else None
+        if previous is not None:
+            sys.setswitchinterval(interval)
+
+        started = time.monotonic()
         try:
             # times=1 because OUR measure() already averages; letting
             # robot_hat retry 10 times internally would stall the thread
@@ -163,6 +208,13 @@ class UltrasonicSensor:
             raise UltrasonicError(
                 "robot_hat read failed: {}: {}".format(type(exc).__name__, exc)
             ) from exc
+        finally:
+            if previous is not None:
+                sys.setswitchinterval(previous)
+
+        if config.SENSOR_LOG_RAW_PINGS:
+            print("PING raw={!r}  took {:.1f}ms".format(
+                value, (time.monotonic() - started) * 1000.0), flush=True)
 
         return self._interpret(value)
 
