@@ -732,6 +732,7 @@ def run_preview_loop(reader, monitor, beeper, states, policy, vision=None,
 
     spoken_generation = 0
     iterations = 0
+    RUNTIME["loop_entered"] = "preview"
     while True:
         iterations += 1
         RUNTIME["iterations"] = iterations
@@ -804,6 +805,7 @@ def run_headless_loop(reader, monitor, beeper, states, policy, vision=None,
     next_print = 0.0
     spoken_generation = 0
     iterations = 0
+    RUNTIME["loop_entered"] = "headless"
 
     while True:
         iterations += 1
@@ -941,6 +943,13 @@ def shutdown(camera, sensor, monitor, player, beeper, vision=None,
 # Entry point
 # ==========================================================================
 def main(argv=None):
+    # The very first statement, before anything can go wrong. If Sense ever
+    # exits with NO output at all, this line's absence proves main() was
+    # never reached - i.e. the file being executed is not this program
+    # (truncated copy, missing entry point, wrong path).
+    print("Sense starting (pid {}, python {})".format(
+        os.getpid(), sys.version.split()[0]), flush=True)
+
     args = parse_args(argv)
     install_signal_handlers()
 
@@ -1052,6 +1061,21 @@ def main(argv=None):
         shutdown(camera, sensor, monitor, player, beeper, vision,
                  speech, speech_player, reader)
 
+    # Sense is a long-running service. Reaching here having never entered a
+    # processing loop means something returned that should not have, and it
+    # must NOT look like success - otherwise systemd logs "Deactivated
+    # successfully" and restarts forever with nothing explaining why.
+    if not RUNTIME.get("loop_entered") and exit_code == 0:
+        print("")
+        print("=" * 62)
+        print("  SENSE EXITED WITHOUT EVER STARTING ITS MAIN LOOP")
+        print("=" * 62)
+        print("  This is a bug, not a normal shutdown. Exiting non-zero so")
+        print("  it shows up as a FAILURE rather than a clean stop.")
+        print("=" * 62)
+        exit_code = 3
+
+    print("Sense exiting with code {}".format(exit_code), flush=True)
     return exit_code
 
 

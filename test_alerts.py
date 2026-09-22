@@ -30,6 +30,7 @@ import alerts
 import config
 import vision
 import _thread
+import ast
 import contextlib
 import inspect
 import io
@@ -2381,6 +2382,118 @@ app.RUNTIME.clear()
 
 check("the Pi-side probe script exists",
       pathlib.Path("deploy/hdmi_probe.sh").exists(), True)
+
+
+# ==========================================================================
+print("\n--headless enters its loop and STAYS there until stopped")
+# ==========================================================================
+# Regression guard. Sense exited immediately and silently with code 0,
+# which systemd reported as "Deactivated successfully" and restarted 23
+# times. A long-running service must never be able to fall out of its loop
+# and still look like success.
+
+_src = inspect.getsource(app.run_headless_loop)
+_fn = ast.parse(_src.lstrip()).body[0]
+_loops = [n for n in ast.walk(_fn) if isinstance(n, ast.While)]
+check("the headless loop exists", len(_loops), 1)
+check("it is a while True", isinstance(_loops[0].test, ast.Constant)
+      and _loops[0].test.value is True, True)
+
+
+def _escapes(loop):
+    """Statements that would let the loop exit cleanly."""
+    found = []
+    for node in ast.walk(loop):
+        if isinstance(node, ast.Break):
+            found.append("break")
+        elif isinstance(node, ast.Return):
+            found.append("return")
+    return found
+
+
+check("the loop has NO clean exit path (no break, no return)",
+      _escapes(_loops[0]), [])
+
+for name in ("run_preview_loop", "run_headless_loop"):
+    body = inspect.getsource(getattr(app, name))
+    check("{} records that it entered its loop".format(name),
+          'RUNTIME["loop_entered"]' in body, True)
+
+_main = inspect.getsource(app.main)
+check("main() announces itself before anything else",
+      "Sense starting" in _main, True)
+check("main() reports its exit code", "Sense exiting with code" in _main, True)
+check("an exit without a loop is NOT reported as success",
+      "exit_code = 3" in _main, True)
+check("and says so loudly",
+      "WITHOUT EVER STARTING ITS MAIN LOOP" in _main, True)
+
+
+# It must actually keep running, not merely look like it.
+class _LiveMon:
+    def __init__(self):
+        self.polls = 0
+
+    def snapshot(self):
+        self.polls += 1
+        return {"distance_cm": 80.0, "out_of_range": False, "error": None,
+                "healthy": True, "reading_count": self.polls}
+
+    def stop(self):
+        pass
+
+    def is_alive(self):
+        return True
+
+
+class _NullBeeper:
+    error = None
+    beep_count = 0
+
+    def set_interval(self, i):
+        pass
+
+    def play_once(self, t):
+        pass
+
+    def stop(self):
+        pass
+
+    def is_alive(self):
+        return True
+
+
+_mon = _LiveMon()
+_done = {"returned": False}
+app.RUNTIME.pop("loop_entered", None)
+
+
+def _run_loop():
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            app.run_headless_loop(None, _mon, _NullBeeper(),
+                                  {k: ("OK", "") for k in
+                                   ("Camera", "Ultrasonic", "Audio",
+                                    "Gemini", "Speech")},
+                                  alerts.AlertPolicy(), None, None)
+    except BaseException:
+        pass
+    _done["returned"] = True
+
+
+_worker = threading.Thread(target=_run_loop, daemon=True)
+_worker.start()
+time.sleep(1.0)
+
+check("the loop was entered", app.RUNTIME.get("loop_entered"), "headless")
+check("it is STILL running after a second", _done["returned"], False)
+check("and it kept polling the sensor", _mon.polls > 20, True)
+check("even with no camera at all", True, True)
+_polls_at_1s = _mon.polls
+time.sleep(0.5)
+check("still running half a second later", _done["returned"], False)
+check("and still polling", _mon.polls > _polls_at_1s, True)
+app.RUNTIME.clear()
 
 
 # ==========================================================================
