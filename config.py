@@ -265,8 +265,24 @@ GEMINI_RESULT_MAX_AGE_S = 4.0
 # Two layers. The SDK timeout asks the HTTP client to give up, and the worker
 # deadline is the wall-clock backstop that discards a reply arriving after a
 # hung socket finally returns. The deadline is the real guarantee.
-GEMINI_REQUEST_TIMEOUT_S = 8.0
-GEMINI_DEADLINE_S = 10.0
+#
+# Gemini enforces a MINIMUM deadline of 10 seconds on generateContent. Asking
+# for less is rejected before the model is even reached:
+#
+#     400 INVALID_ARGUMENT: Manually set deadline 8s is too short.
+#                           Minimum allowed deadline is 10s.
+#
+# So GEMINI_REQUEST_TIMEOUT_S must never go below GEMINI_MIN_TIMEOUT_S.
+# vision.py clamps it as a safety net, but set it correctly here.
+GEMINI_MIN_TIMEOUT_S = 10.0
+
+# 20s gives image analysis comfortable headroom on a Pi 3 over Wi-Fi.
+GEMINI_REQUEST_TIMEOUT_S = 20.0
+
+# Must be >= GEMINI_REQUEST_TIMEOUT_S, otherwise the worker would abandon a
+# reply while the SDK was still legitimately waiting for it, and the timeout
+# above would never actually come into play.
+GEMINI_DEADLINE_S = 25.0
 
 # --- Image ---------------------------------------------------------------
 # 640x480 fits inside a single 768x768 tile, which costs 258 image tokens,

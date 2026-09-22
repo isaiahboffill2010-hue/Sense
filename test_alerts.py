@@ -561,6 +561,46 @@ check("the project's own key parses as a valid AQ. key",
 
 
 # ==========================================================================
+print("\nGemini timeouts respect the API minimum and stay layered")
+# ==========================================================================
+# Gemini rejects a deadline under 10s before the model is even reached:
+#   400 INVALID_ARGUMENT: Manually set deadline 8s is too short.
+# These checks exist so that never silently comes back.
+
+check("the configured SDK timeout meets Gemini's minimum",
+      config.GEMINI_REQUEST_TIMEOUT_S >= config.GEMINI_MIN_TIMEOUT_S, True)
+check("the documented minimum is 10s",
+      config.GEMINI_MIN_TIMEOUT_S, 10.0)
+check("the effective timeout is what we configured",
+      vision.GeminiWorker._effective_timeout_s(),
+      config.GEMINI_REQUEST_TIMEOUT_S)
+
+# The worker deadline must not cut a request off while the SDK is still
+# legitimately waiting, or the SDK timeout would never come into play.
+check("the worker deadline is at least the SDK timeout",
+      config.GEMINI_DEADLINE_S >= config.GEMINI_REQUEST_TIMEOUT_S, True)
+
+# A too-low value in config.py must degrade to the minimum, not break
+# every call.
+_saved_timeout = config.GEMINI_REQUEST_TIMEOUT_S
+try:
+    config.GEMINI_REQUEST_TIMEOUT_S = 8.0
+    check("a too-low configured timeout is clamped up to the minimum",
+          vision.GeminiWorker._effective_timeout_s(),
+          config.GEMINI_MIN_TIMEOUT_S)
+    config.GEMINI_REQUEST_TIMEOUT_S = 30.0
+    check("a generous timeout is left alone",
+          vision.GeminiWorker._effective_timeout_s(), 30.0)
+finally:
+    config.GEMINI_REQUEST_TIMEOUT_S = _saved_timeout
+
+# Staleness is a separate, deliberate product rule - flag if the timeout
+# budget now exceeds it, because replies that slow would be discarded.
+check("staleness window is still the tightest limit (by design)",
+      config.GEMINI_RESULT_MAX_AGE_S <= config.GEMINI_REQUEST_TIMEOUT_S, True)
+
+
+# ==========================================================================
 print("")
 if FAILURES:
     print("{} FAILED: {}".format(len(FAILURES), ", ".join(FAILURES)))

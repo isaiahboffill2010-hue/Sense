@@ -224,6 +224,22 @@ class GeminiWorker(threading.Thread):
         return self
 
     @staticmethod
+    def _effective_timeout_s():
+        """The SDK timeout to actually use, in seconds.
+
+        Gemini rejects a deadline below 10 seconds outright:
+
+            400 INVALID_ARGUMENT: Manually set deadline 8s is too short.
+                                  Minimum allowed deadline is 10s.
+
+        That failure happens before the model is reached, so it looks like a
+        request problem rather than a configuration one. Clamping here means
+        a too-low value in config.py degrades to the minimum instead of
+        breaking every single call.
+        """
+        return max(config.GEMINI_REQUEST_TIMEOUT_S, config.GEMINI_MIN_TIMEOUT_S)
+
+    @staticmethod
     def _make_client(genai):
         """Build a Gemini DEVELOPER API client with explicit credentials.
 
@@ -289,7 +305,7 @@ class GeminiWorker(threading.Thread):
                 kwargs[flag] = False
                 pinned.append(flag)
 
-        timeout_ms = int(config.GEMINI_REQUEST_TIMEOUT_S * 1000)
+        timeout_ms = int(GeminiWorker._effective_timeout_s() * 1000)
         timeout_note = "no SDK timeout, {:.0f}s worker deadline only".format(
             config.GEMINI_DEADLINE_S
         )
