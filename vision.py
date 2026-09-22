@@ -182,6 +182,53 @@ def _redact(text, secret):
     return rendered
 
 
+def describe_api_error(exc, limit=700):
+    """Everything useful a google-genai error carries, as one line.
+
+    str(exc) alone is uselessly terse for a rejected request - it says
+    "400 INVALID_ARGUMENT. Request contains an invalid argument." and stops,
+    which tells you nothing about WHICH argument. The structured attributes
+    and the raw response body are where the field violations live, so pull
+    those out too.
+
+    The API key is stripped out, in case a future SDK echoes the request.
+    """
+    parts = ["{}: {}".format(type(exc).__name__, exc)]
+
+    for attribute in ("code", "status", "message"):
+        value = getattr(exc, attribute, None)
+        if value not in (None, ""):
+            text = " ".join(str(value).split())
+            if text and text not in parts[0]:
+                parts.append("{}={}".format(attribute, text))
+
+    details = getattr(exc, "details", None)
+    if details:
+        parts.append("details={}".format(" ".join(str(details).split())))
+
+    # The HTTP body usually names the offending field.
+    response = getattr(exc, "response", None)
+    for attribute in ("text", "content", "body"):
+        raw = getattr(response, attribute, None) if response is not None else None
+        if raw:
+            try:
+                body = raw.decode("utf-8", "replace") if isinstance(
+                    raw, (bytes, bytearray)) else str(raw)
+            except Exception:
+                continue
+            body = " ".join(body.split())
+            if body and body not in parts[0]:
+                parts.append("body={}".format(body))
+            break
+
+    rendered = "  |  ".join(parts)
+    secret = os.environ.get(config.GEMINI_API_KEY_ENV, "").strip()
+    rendered = _redact(rendered, secret)
+    if len(rendered) > limit:
+        rendered = rendered[:limit] + "..."
+    return rendered
+
+
 # ==========================================================================
 # The worker
 # ==========================================================================
@@ -211,6 +258,7 @@ class GeminiWorker(threading.Thread):
         self._client = None
         self._gen_config = None
         self._gen_config_note = "defaults"
+        self._thinking_dropped = False
         self.description = ""      # how the client is configured, for the UI
         self.prewarm_note = None
 
@@ -275,15 +323,22 @@ class GeminiWorker(threading.Thread):
         return self
 
     @staticmethod
-    def _make_generate_config():
-        """Constrain the reply, which is the biggest latency lever we have.
+    def _make_generate_config(include_thinking=True):
+        """Build the GenerateContentConfig for every request.
 
-        An unconstrained model can spend seconds generating prose for a
-        question that needs six words, and some models burn extra time on
-        hidden "thinking" tokens first. Both are pure latency here.
+        The thinking option is the part that has to be model-aware, and
+        getting it wrong is rejected before the model is even reached:
 
-        Every option is applied defensively: if this SDK build rejects one,
-        we fall back rather than refusing to start.
+            Gemini 2.5   thinking_budget=0       disables thinking
+            Gemini 3     thinking_level="LOW"    thinking CANNOT be
+                                                 disabled, and sending
+                                                 thinking_budget at all
+                                                 returns 400 INVALID_ARGUMENT
+
+        Construction is guarded, but note that construction succeeding
+        proves nothing: the SDK happily builds a config the SERVER will
+        reject. That is exactly how the 400 got shipped. So callers must
+        also handle rejection at request time - see _call_gemini.
         """
         try:
             from google.genai import types
@@ -296,13 +351,13 @@ class GeminiWorker(threading.Thread):
         }
         applied = ["max_tokens={}".format(config.GEMINI_MAX_OUTPUT_TOKENS)]
 
-        if config.GEMINI_DISABLE_THINKING:
-            try:
-                fields["thinking_config"] = types.ThinkingConfig(
-                    thinking_budget=0)
-                applied.append("thinking off")
-            except Exception:
-                applied.append("thinking option unsupported")
+        if include_thinking:
+            thinking, note = GeminiWorker._make_thinking_config(types)
+            if thinking is not None:
+                fields["thinking_config"] = thinking
+            applied.append(note)
+        else:
+            applied.append("thinking option dropped")
 
         try:
             return types.GenerateContentConfig(**fields), ", ".join(applied)
@@ -318,6 +373,37 @@ class GeminiWorker(threading.Thread):
             )
         except Exception:
             return None, "no response config"
+
+    @staticmethod
+    def _make_thinking_config(types):
+        """The thinking option this MODEL accepts, or (None, why not).
+
+        Gemini 3 models are thinking-only. They take thinking_level and
+        reject thinking_budget outright; Gemini 2.5 models are the reverse.
+        Sending both is also an error, so exactly one form is used.
+        """
+        model = str(config.GEMINI_MODEL).lower()
+        is_gemini_3 = model.startswith("gemini-3")
+
+        if is_gemini_3:
+            level = config.GEMINI_THINKING_LEVEL
+            if not level:
+                return None, "thinking at model default"
+            try:
+                return (types.ThinkingConfig(thinking_level=str(level).upper()),
+                        "thinking_level={}".format(str(level).upper()))
+            except Exception:
+                # Older SDK with no thinking_level field: send nothing
+                # rather than the thinking_budget this model would reject.
+                return None, "thinking_level unsupported by SDK"
+
+        if config.GEMINI_DISABLE_THINKING:
+            try:
+                return types.ThinkingConfig(thinking_budget=0), "thinking off"
+            except Exception:
+                return None, "thinking_budget unsupported by SDK"
+
+        return None, "thinking at model default"
 
     @staticmethod
     def _effective_timeout_s():
@@ -613,9 +699,11 @@ class GeminiWorker(threading.Thread):
                 config=self._gen_config,
             )
         except Exception as exc:
-            # Never fatal - this is an optimisation, not a dependency.
-            return "prewarm skipped ({}: {})".format(
-                type(exc).__name__, str(exc)[:60])
+            # Never fatal - this is an optimisation, not a dependency. It is
+            # also the canary: it sends the same generation config as a real
+            # request with no image at all, so a failure here points
+            # squarely at the request configuration.
+            return "prewarm skipped - {}".format(describe_api_error(exc))
         return "connection warm ({:.0f} ms)".format(
             (time.monotonic() - started) * 1000)
 
@@ -670,7 +758,7 @@ class GeminiWorker(threading.Thread):
         try:
             raw = self._call_gemini(jpeg_bytes, request.distance_cm)
         except Exception as exc:
-            self._record_error("{}: {}".format(type(exc).__name__, exc))
+            self._record_error(describe_api_error(exc))
             return
         api_ms = (time.monotonic() - api_started) * 1000.0
 
@@ -806,15 +894,63 @@ class GeminiWorker(threading.Thread):
             distance_cm=int(distance_cm) if distance_cm is not None else "unknown"
         )
 
-        response = self._client.models.generate_content(
-            model=config.GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
-                prompt,
-            ],
-            config=self._gen_config,
-        )
+        contents = [
+            types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
+            prompt,
+        ]
+
+        try:
+            response = self._client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=contents,
+                config=self._gen_config,
+            )
+        except Exception as exc:
+            # A rejected REQUEST CONFIG is fatal for every future call too,
+            # so if the server refuses our generation options we drop the
+            # thinking option once, say so plainly, and carry on without it.
+            # This is not swallowing the error - the full server message is
+            # printed first, including whichever field it objected to.
+            if not self._retry_without_thinking(exc):
+                raise
+            response = self._client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=contents,
+                config=self._gen_config,
+            )
+
         return getattr(response, "text", None)
+
+    def _retry_without_thinking(self, exc):
+        """True if we just disabled the thinking option in response to `exc`.
+
+        Only ever fires once, and only for an invalid-argument rejection
+        while a thinking option was actually attached.
+        """
+        if self._thinking_dropped:
+            return False
+        if getattr(exc, "code", None) != 400 and "400" not in str(exc):
+            return False
+        if "thinking" not in str(self._gen_config_note).lower():
+            return False
+
+        print(
+            "GEMINI ERROR: request config rejected: {}".format(
+                describe_api_error(exc)),
+            flush=True,
+        )
+
+        self._thinking_dropped = True
+        self._gen_config, note = self._make_generate_config(
+            include_thinking=False)
+        self._gen_config_note = note
+        print(
+            "GEMINI: retrying without the thinking option [{}]. "
+            "Set GEMINI_THINKING_LEVEL = None in config.py to stop asking."
+            .format(note),
+            flush=True,
+        )
+        return True
 
     @staticmethod
     def _tidy(text):

@@ -901,8 +901,14 @@ check("the prompt forbids inventing a direction",
       "never invent a direction" in config.GEMINI_PROMPT, True)
 check("the prompt gives the no-information fallback",
       '"Obstacle ahead."' in config.GEMINI_PROMPT, True)
-check("replies are capped in length",
-      config.GEMINI_MAX_OUTPUT_TOKENS <= 64, True)
+# The VISIBLE reply is bounded by the prompt and by _tidy(), not by the
+# token cap - the cap has to stay generous because Gemini 3 charges its
+# hidden thinking tokens against the same budget.
+check("the prompt asks for at most six words",
+      "at most six words" in config.GEMINI_PROMPT, True)
+check("and the reply is hard-truncated for display",
+      len(vision.GeminiWorker._tidy("word " * 100)),
+      config.GEMINI_MAX_DESCRIPTION_CHARS)
 check("frames are downscaled before upload",
       config.GEMINI_SEND_RESOLUTION[0] < config.CAMERA_RESOLUTION[0], True)
 
@@ -1002,6 +1008,175 @@ check("only the newest phrase is pending", talker2._pending_text,
 check("a long phrase is truncated",
       len(_clean_for_speech("x" * 500)), config.SPEECH_MAX_CHARS)
 check("danger muting is enabled by default", config.SPEECH_MUTE_IN_DANGER, True)
+
+
+# ==========================================================================
+print("\nRequest config: the right thinking option for the model")
+# ==========================================================================
+# This section exists because of a real 400. Gemini 3 models are
+# thinking-only: they accept thinking_level and REJECT thinking_budget with
+#
+#     400 INVALID_ARGUMENT. Request contains an invalid argument.
+#
+# Sending thinking_budget=0 to gemini-3.5-flash-lite broke every request,
+# including the text-only prewarm. Construction of the config succeeded, so
+# nothing caught it locally - the SDK builds a config the SERVER rejects.
+
+
+class StubThinkingConfig:
+    """Mimics types.ThinkingConfig field validation."""
+
+    ALLOWED = {"thinking_level", "thinking_budget"}
+
+    def __init__(self, **kwargs):
+        bad = set(kwargs) - self.ALLOWED
+        if bad:
+            raise TypeError("unexpected field(s): {}".format(sorted(bad)))
+        self.kwargs = kwargs
+
+
+class StubTypes:
+    ThinkingConfig = StubThinkingConfig
+
+
+class OldSdkTypes:
+    """An SDK predating thinking_level."""
+
+    class ThinkingConfig:
+        def __init__(self, **kwargs):
+            if "thinking_level" in kwargs:
+                raise TypeError("no such field: thinking_level")
+            self.kwargs = kwargs
+
+
+_saved_model = config.GEMINI_MODEL
+_saved_level = config.GEMINI_THINKING_LEVEL
+try:
+    for model in ("gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3-pro"):
+        config.GEMINI_MODEL = model
+        cfg, _note = vision.GeminiWorker._make_thinking_config(StubTypes)
+        check("{}: uses thinking_level".format(model),
+              cfg is not None and "thinking_level" in cfg.kwargs, True)
+        check("{}: NEVER sends thinking_budget".format(model),
+              cfg is not None and "thinking_budget" not in cfg.kwargs, True)
+
+    for model in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):
+        config.GEMINI_MODEL = model
+        cfg, _note = vision.GeminiWorker._make_thinking_config(StubTypes)
+        check("{}: disables thinking with a budget".format(model),
+              cfg is not None and cfg.kwargs, {"thinking_budget": 0})
+
+    config.GEMINI_MODEL = "gemini-3.5-flash-lite"
+    config.GEMINI_THINKING_LEVEL = None
+    cfg, note = vision.GeminiWorker._make_thinking_config(StubTypes)
+    check("GEMINI_THINKING_LEVEL=None sends no thinking option", cfg, None)
+    check("and says so", "default" in note, True)
+
+    # The dangerous fallback would be quietly reverting to thinking_budget.
+    config.GEMINI_THINKING_LEVEL = "LOW"
+    cfg, note = vision.GeminiWorker._make_thinking_config(OldSdkTypes)
+    check("an SDK without thinking_level sends NOTHING, not a budget",
+          cfg, None)
+    check("and explains why", "unsupported" in note, True)
+finally:
+    config.GEMINI_MODEL = _saved_model
+    config.GEMINI_THINKING_LEVEL = _saved_level
+
+check("the configured model is a Gemini 3 model",
+      config.GEMINI_MODEL.startswith("gemini-3"), True)
+check("the configured thinking level is one the API accepts",
+      config.GEMINI_THINKING_LEVEL in (None, "LOW", "MEDIUM", "HIGH"), True)
+
+# Thinking tokens are charged against max_output_tokens on Gemini 3, and
+# thinking cannot be switched off - so a tight cap can be entirely consumed
+# by hidden reasoning, returning an empty description. 48 was far too low.
+check("the output cap is generous enough to survive thinking tokens",
+      config.GEMINI_MAX_OUTPUT_TOKENS >= 256, True)
+
+
+# ==========================================================================
+print("\nAPI errors are reported in enough detail to name the bad field")
+# ==========================================================================
+
+
+class FakeClientError(Exception):
+    def __init__(self, message, code=400, status="INVALID_ARGUMENT", body=None):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.message = message
+        if body is not None:
+            class Resp:
+                text = body
+            self.response = Resp()
+
+
+rejection = FakeClientError(
+    "400 INVALID_ARGUMENT. Request contains an invalid argument.",
+    body='{"error":{"message":"thinking_budget is not supported by this model."}}',
+)
+described = vision.describe_api_error(rejection)
+check("the description includes the status code",
+      "400" in described, True)
+check("the description includes the status name",
+      "INVALID_ARGUMENT" in described, True)
+check("the description includes the response body",
+      "thinking_budget is not supported" in described, True)
+check("which is what names the offending parameter",
+      "thinking_budget" in described, True)
+check("the description is one line",
+      "\n" in described, False)
+
+# An error with nothing but a string must still describe cleanly.
+plain = vision.describe_api_error(RuntimeError("boom"))
+check("a plain exception still describes", plain, "RuntimeError: boom")
+
+# The key must never leak, even if a future SDK echoes the request.
+_saved_key = os.environ.get("GEMINI_API_KEY")
+os.environ["GEMINI_API_KEY"] = "AQ.super-secret-value"
+try:
+    leaky = vision.describe_api_error(
+        FakeClientError("bad request", body="key=AQ.super-secret-value"))
+    check("the API key is redacted from error text",
+          "AQ.super-secret-value" in leaky, False)
+    check("and replaced with a marker", "<redacted>" in leaky, True)
+finally:
+    if _saved_key is None:
+        os.environ.pop("GEMINI_API_KEY", None)
+    else:
+        os.environ["GEMINI_API_KEY"] = _saved_key
+
+# Long errors are truncated so one bad reply cannot flood the terminal.
+check("very long errors are truncated",
+      len(vision.describe_api_error(RuntimeError("x" * 5000))) <= 705, True)
+
+
+# ==========================================================================
+print("\nA rejected request config is dropped once, not silently retried")
+# ==========================================================================
+worker = vision.GeminiWorker()
+worker._gen_config_note = "max_tokens=512, thinking_level=LOW"
+worker._make_generate_config = staticmethod(
+    lambda include_thinking=True: (None, "max_tokens=512, thinking dropped"))
+
+check("a 400 with thinking attached triggers the fallback",
+      worker._retry_without_thinking(rejection), True)
+check("the thinking option is now marked dropped",
+      worker._thinking_dropped, True)
+check("it never fires twice",
+      worker._retry_without_thinking(rejection), False)
+
+worker = vision.GeminiWorker()
+worker._gen_config_note = "max_tokens=512, thinking_level=LOW"
+check("a quota error is NOT treated as a config problem",
+      worker._retry_without_thinking(
+          FakeClientError("429 RESOURCE_EXHAUSTED", code=429, status="X")),
+      False)
+
+worker = vision.GeminiWorker()
+worker._gen_config_note = "max_tokens only"
+check("with no thinking option attached there is nothing to drop",
+      worker._retry_without_thinking(rejection), False)
 
 
 # ==========================================================================

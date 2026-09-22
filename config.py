@@ -318,13 +318,31 @@ GEMINI_DEADLINE_S = 25.0
 GEMINI_SEND_RESOLUTION = (512, 384)
 GEMINI_JPEG_QUALITY = 75
 
-# Cap the reply. A six-word navigation phrase needs very few tokens, and an
-# unconstrained model can spend seconds generating prose we then throw away.
-GEMINI_MAX_OUTPUT_TOKENS = 48
+# Cap the reply.
+#
+# This must be generous, NOT tight. On Gemini 3 models thinking cannot be
+# turned off, and thinking tokens are charged against this same output
+# budget - so a small cap can be entirely consumed by hidden reasoning,
+# leaving an empty description. The prompt is what keeps the visible answer
+# to six words; this is only a runaway guard.
+GEMINI_MAX_OUTPUT_TOKENS = 512
 
-# Ask the model not to "think" before answering, where the SDK supports it.
-# Thinking tokens are pure latency for a task this small. Ignored safely if
-# the installed SDK or model does not accept the option.
+# --- thinking ------------------------------------------------------------
+# Hidden "thinking" tokens are mostly latency for a six-word answer, so we
+# ask for as little of it as the model allows. HOW you ask depends on the
+# model generation, and getting it wrong is rejected outright:
+#
+#   Gemini 2.5:  thinking_budget=0            disables thinking entirely
+#   Gemini 3  :  thinking_level="LOW"         thinking CANNOT be disabled;
+#                                             sending thinking_budget gives
+#                                             400 INVALID_ARGUMENT
+#
+# vision.py picks the right form from GEMINI_MODEL. Set this to None to send
+# no thinking option at all and take the model's default.
+GEMINI_THINKING_LEVEL = "LOW"
+
+# Kept for the Gemini 2.5 style models only - see above. Has no effect on
+# Gemini 3, where thinking is always on.
 GEMINI_DISABLE_THINKING = True
 
 # Make one tiny throwaway call at startup so DNS, TLS and the connection
