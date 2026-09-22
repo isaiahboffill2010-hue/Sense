@@ -2278,13 +2278,21 @@ def _run_loop_briefly(camera, seconds=0.8):
         _thread.interrupt_main()
 
     threading.Thread(target=interrupt, daemon=True).start()
+    # NOT contextlib.redirect_stdout: interrupt_main() can land while the
+    # context manager is unwinding, which would leave sys.stdout pointing
+    # at a dead buffer and silently swallow the rest of the suite. Restore
+    # it in a finally instead.
+    captured = io.StringIO()
+    real_stdout = sys.stdout
     try:
-        with contextlib.redirect_stdout(io.StringIO()) as captured:
-            app.run_headless_loop(reader, monitor, beeper,
-                                  dict(_STALL_STATES),
-                                  alerts.AlertPolicy(), None, None)
-    except KeyboardInterrupt:
+        sys.stdout = captured
+        app.run_headless_loop(reader, monitor, beeper,
+                              dict(_STALL_STATES),
+                              alerts.AlertPolicy(), None, None)
+    except BaseException:
         pass
+    finally:
+        sys.stdout = real_stdout
     reader.stop(timeout=0.2)
     return beeper, monitor, reader, captured.getvalue()
 
