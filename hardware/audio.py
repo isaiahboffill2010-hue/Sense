@@ -785,28 +785,47 @@ class SpeechController(threading.Thread):
 
     # ------------------------------------------------------------- requests
     def say(self, text):
-        """Queue a phrase. Returns True if it was accepted for speaking."""
+        """Queue a phrase. Returns True if it was accepted for speaking.
+
+        Every outcome is logged, because "the text appeared but I heard
+        nothing" is otherwise impossible to diagnose from the outside.
+        """
         phrase = _clean_for_speech(text)
         if not phrase:
+            print("SPEECH SUPPRESSED: empty phrase", flush=True)
             return False
 
+        reason = None
         with self._lock:
             if self._muted:
-                self._suppressed_count += 1
-                return False
+                reason = "danger" if config.SPEECH_MUTE_IN_DANGER else "muted"
+            else:
+                gap = config.SPEECH_DUPLICATE_GAP_S
+                if (
+                    gap > 0
+                    and phrase == self._last_text
+                    and self._last_spoken_at is not None
+                    and (self._now() - self._last_spoken_at) < gap
+                ):
+                    reason = "duplicate, spoken {:.0f}s ago (gap {:.0f}s)".format(
+                        self._now() - self._last_spoken_at, gap)
 
-            gap = config.SPEECH_DUPLICATE_GAP_S
-            if (
-                gap > 0
-                and phrase == self._last_text
-                and self._last_spoken_at is not None
-                and (self._now() - self._last_spoken_at) < gap
-            ):
+            if reason is None:
+                # Newest wins: whatever was waiting is replaced, not queued.
+                replaced = self._pending_text
+                self._pending_text = phrase
+            else:
                 self._suppressed_count += 1
-                return False
 
-            # Newest wins: whatever was waiting is replaced, not queued.
-            self._pending_text = phrase
+        if reason is not None:
+            print("SPEECH SUPPRESSED: {} - {}".format(reason, phrase),
+                  flush=True)
+            return False
+
+        if replaced and replaced != phrase:
+            print("SPEECH REPLACED: {} -> {}".format(replaced, phrase),
+                  flush=True)
+        print("SPEECH QUEUED: {}".format(phrase), flush=True)
         return True
 
     def set_muted(self, muted):
@@ -820,8 +839,20 @@ class SpeechController(threading.Thread):
             self._muted = bool(muted)
             if muted:
                 self._pending_text = None
+            current = self._last_text
+
         if muted and changed:
+            # This is where a phrase in progress actually gets cut off, so
+            # this is where the interruption is logged.
+            was_speaking = False
+            try:
+                was_speaking = self._player.is_speaking()
+            except Exception:
+                pass
             self._player.stop()
+            if was_speaking:
+                print("SPEECH INTERRUPTED: danger - {}".format(current or ""),
+                      flush=True)
 
     @property
     def muted(self):
@@ -870,10 +901,13 @@ class SpeechController(threading.Thread):
         except AudioError as exc:
             with self._lock:
                 self._error = str(exc)
+            print("SPEECH ERROR: {}".format(exc), flush=True)
             return
         except Exception as exc:
+            detail = "{}: {}".format(type(exc).__name__, exc)
             with self._lock:
-                self._error = "{}: {}".format(type(exc).__name__, exc)
+                self._error = detail
+            print("SPEECH ERROR: {}".format(detail), flush=True)
             return
 
         with self._lock:
@@ -882,10 +916,20 @@ class SpeechController(threading.Thread):
             self._last_spoken_at = self._now()
             self._spoken_count += 1
 
+        print("SPEECH PLAYING: {}".format(text), flush=True)
+
         # Wait for it to finish, but stay responsive to mute and shutdown.
         while self._player.is_speaking():
             if self._stop_event.is_set() or self.muted:
+                # set_muted() already logged and stopped the danger case;
+                # reaching here means shutdown, or a mute we observed first.
                 self._player.stop()
+                if self._stop_event.is_set():
+                    print("SPEECH INTERRUPTED: shutdown - {}".format(text),
+                          flush=True)
+                else:
+                    print("SPEECH INTERRUPTED: danger - {}".format(text),
+                          flush=True)
                 break
             self._stop_event.wait(self.POLL_S)
 

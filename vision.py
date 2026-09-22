@@ -640,7 +640,16 @@ class GeminiWorker(threading.Thread):
             state = STATE_IDLE
 
         return {
+            # Display-gated: disappears from the HUD once it has been on
+            # screen for GEMINI_RESULT_MAX_AGE_S.
             "description": None if (stale or not text) else text,
+            # NOT display-gated. If the relevance check accepted a reply it
+            # is worth SAYING, even if it arrived too late to linger on the
+            # HUD. Speech must follow acceptance, not the display window -
+            # tying speech to `description` meant any reply arriving between
+            # GEMINI_RESULT_MAX_AGE_S and GEMINI_ACCEPT_MAX_AGE_S was
+            # printed and then never spoken.
+            "accepted_text": text,
             "generation": generation,
             "distance_cm": distance_cm,
             "status": status,
@@ -803,7 +812,8 @@ class GeminiWorker(threading.Thread):
             self._reply_count += 1
 
         print(
-            "AI: {}   [{}cm {} via {}  enc {:.0f}ms  api {:.0f}ms  age {:.1f}s]"
+            "AI ACCEPTED: {}   [{}cm {} via {}  enc {:.0f}ms  api {:.0f}ms  "
+            "age {:.1f}s]"
             .format(
                 text,
                 "{:.0f}".format(request.distance_cm)

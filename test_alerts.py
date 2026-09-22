@@ -29,6 +29,10 @@ import time
 import alerts
 import config
 import vision
+import contextlib
+import io
+
+import main as app
 import hardware.audio as audio_module
 from hardware.audio import (
     TONE_DANGER,
@@ -1343,6 +1347,199 @@ finally:
 
 check("a startup phrase is configured for the playback test",
       bool(config.SPEECH_STARTUP_PHRASE), True)
+
+
+# ==========================================================================
+print("\nAn accepted Gemini result always reaches speech")
+# ==========================================================================
+# This section exists because of a real bug. Speech read
+# snapshot()["description"], which is gated by the HUD DISPLAY window
+# (GEMINI_RESULT_MAX_AGE_S = 8s), while acceptance used the more generous
+# relevance backstop (GEMINI_ACCEPT_MAX_AGE_S = 12s).
+#
+# Any reply landing between those two limits was accepted, printed to the
+# terminal, and then permanently unspeakable - description was already None
+# and only got older. That is exactly "I see the text but hear nothing".
+#
+# Speech now follows ACCEPTANCE via snapshot()["accepted_text"].
+
+check("the display window is tighter than the acceptance backstop",
+      config.GEMINI_RESULT_MAX_AGE_S < config.GEMINI_ACCEPT_MAX_AGE_S, True)
+
+
+class _SpyTalker:
+    """Records say()/set_muted() the way SpeechController would see them."""
+
+    def __init__(self):
+        self.said = []
+        self.muted = False
+
+    def say(self, text):
+        if self.muted:
+            return False
+        self.said.append(text)
+        return True
+
+    def set_muted(self, muted):
+        self.muted = bool(muted)
+
+
+def _worker_with_reply(api_seconds, text="Person ahead, slightly left."):
+    """A worker that has just processed a reply which took api_seconds."""
+    w = vision.GeminiWorker()
+    w._latest_request_id = 1
+    w._encode_jpeg = staticmethod(lambda frame: b"jpeg")
+    w._call_gemini = lambda jpeg, distance: text
+    w.note_current_state(80.0, "CAUTION")
+    request = vision.AiRequest(
+        FakeFrame(), 80.0, "CAUTION",
+        time.monotonic() - api_seconds, 1, "band")
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        w._process_request(request)
+    return w, buffer.getvalue()
+
+
+# Fast reply: shown AND spoken.
+worker, logged = _worker_with_reply(2.0)
+snap = worker.snapshot()
+check("a fast reply is accepted", snap["reply_count"], 1)
+check("a fast reply is shown on the HUD", bool(snap["description"]), True)
+check("a fast reply is available to speech", bool(snap["accepted_text"]), True)
+check("acceptance is logged in the requested format",
+      "AI ACCEPTED:" in logged, True)
+
+talker = _SpyTalker()
+check("and it is spoken", app.speak_new_guidance(worker, talker, 0), 1)
+check("with the right text", talker.said, ["Person ahead, slightly left."])
+
+# THE BUG: slow but still-relevant reply. Too old for the HUD, but accepted.
+for slow in (config.GEMINI_RESULT_MAX_AGE_S + 1,
+             config.GEMINI_ACCEPT_MAX_AGE_S - 0.5):
+    worker, _logged = _worker_with_reply(slow)
+    snap = worker.snapshot()
+    check("api {:.1f}s: accepted".format(slow), snap["reply_count"], 1)
+    check("api {:.1f}s: too old for the HUD".format(slow),
+          snap["description"], None)
+    check("api {:.1f}s: still available to speech".format(slow),
+          bool(snap["accepted_text"]), True)
+
+    talker = _SpyTalker()
+    app.speak_new_guidance(worker, talker, 0)
+    check("api {:.1f}s: IS SPOKEN anyway".format(slow),
+          talker.said, ["Person ahead, slightly left."])
+
+# Beyond the backstop it is rejected outright - and must NOT be spoken.
+worker, _logged = _worker_with_reply(config.GEMINI_ACCEPT_MAX_AGE_S + 2)
+snap = worker.snapshot()
+check("beyond the backstop it is not accepted", snap["reply_count"], 0)
+check("and nothing is offered to speech", snap["accepted_text"], None)
+talker = _SpyTalker()
+app.speak_new_guidance(worker, talker, 0)
+check("so it is never spoken", talker.said, [])
+
+# A superseded reply must not be spoken either - relevance still rules.
+worker = vision.GeminiWorker()
+worker._latest_request_id = 9          # a newer request exists
+worker._encode_jpeg = staticmethod(lambda frame: b"jpeg")
+worker._call_gemini = lambda jpeg, distance: "Stale guidance."
+worker.note_current_state(80.0, "CAUTION")
+with contextlib.redirect_stdout(io.StringIO()):
+    worker._process_request(vision.AiRequest(
+        FakeFrame(), 80.0, "CAUTION", time.monotonic(), 1, "band"))
+talker = _SpyTalker()
+app.speak_new_guidance(worker, talker, 0)
+check("a superseded reply is not spoken", talker.said, [])
+
+# Each accepted generation is spoken exactly once, however many frames pass.
+worker, _logged = _worker_with_reply(1.0)
+talker = _SpyTalker()
+generation = 0
+for _ in range(20):
+    generation = app.speak_new_guidance(worker, talker, generation)
+check("one accepted result is spoken once across many frames",
+      len(talker.said), 1)
+
+# A suppressed phrase still advances the generation, so the suppression
+# reason is logged once rather than on every single frame.
+worker, _logged = _worker_with_reply(1.0)
+talker = _SpyTalker()
+talker.muted = True
+generation = app.speak_new_guidance(worker, talker, 0)
+check("a suppressed phrase still marks the generation handled",
+      generation, worker.snapshot()["generation"])
+check("and nothing was spoken", talker.said, [])
+
+
+# ==========================================================================
+print("\nSpeech logging says exactly why a phrase was not spoken")
+# ==========================================================================
+
+
+class _SlowVoice:
+    """A voice that keeps 'speaking' until released, so we can interrupt it."""
+
+    def __init__(self):
+        self.spoken = []
+        self.stops = 0
+        self.busy = False
+
+    def speak(self, text):
+        self.spoken.append(text)
+        self.busy = True
+        return True
+
+    def is_speaking(self):
+        return self.busy
+
+    def stop(self):
+        self.stops += 1
+        self.busy = False
+
+
+def _capture(action):
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        action()
+        time.sleep(0.25)
+    return buffer.getvalue()
+
+
+voice = _SlowVoice()
+clock = FakeClock()
+talker = SpeechController(voice, now=clock)
+talker.start()
+try:
+    logged = _capture(lambda: talker.say("Person ahead, left."))
+    check("queueing is logged", "SPEECH QUEUED: Person ahead, left." in logged,
+          True)
+    check("playing is logged", "SPEECH PLAYING: Person ahead, left." in logged,
+          True)
+
+    # Danger arrives mid-phrase: the voice must be cut off and say so.
+    logged = _capture(lambda: talker.set_muted(True))
+    check("danger interrupts the phrase in progress", voice.stops >= 1, True)
+    check("and the interruption is logged",
+          "SPEECH INTERRUPTED: danger" in logged, True)
+
+    logged = _capture(lambda: talker.say("Chair ahead, move right."))
+    check("a phrase during danger is suppressed with the reason",
+          "SPEECH SUPPRESSED: danger" in logged, True)
+
+    talker.set_muted(False)
+    voice.busy = False
+    clock.advance(1.0)
+    logged = _capture(lambda: talker.say("Person ahead, left."))
+    check("a duplicate is suppressed with the reason",
+          "SPEECH SUPPRESSED: duplicate" in logged, True)
+
+    logged = _capture(lambda: talker.say("   "))
+    check("an empty phrase is suppressed with the reason",
+          "SPEECH SUPPRESSED: empty" in logged, True)
+finally:
+    talker.stop()
+
+check("danger muting is still enabled", config.SPEECH_MUTE_IN_DANGER, True)
 
 
 # ==========================================================================

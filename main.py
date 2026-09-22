@@ -216,10 +216,21 @@ def speak_new_guidance(vision, speech, spoken_generation):
 
     ai = vision.snapshot()
     generation = ai["generation"]
-    if generation == spoken_generation or not ai["description"]:
+    if generation == spoken_generation:
         return spoken_generation
 
-    speech.say(ai["description"])
+    # Deliberately `accepted_text`, NOT `description`. `description` is
+    # gated by the HUD display window, and a reply that arrives slowly can
+    # be accepted by the relevance check yet already be too old to show -
+    # which previously meant it was printed but never spoken.
+    text = ai["accepted_text"]
+    if not text:
+        return spoken_generation
+
+    speech.say(text)
+    # Mark it handled either way. say() logs its own reason when it declines
+    # (danger, duplicate), and retrying the same generation every frame
+    # would just repeat that log forever.
     return generation
 
 
