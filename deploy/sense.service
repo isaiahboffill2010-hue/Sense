@@ -1,0 +1,90 @@
+[Unit]
+Description=Sense - wearable navigation headband
+Documentation=https://github.com/isaiahboffill2010-hue/Sense
+
+# Network is wanted so Gemini can reach the API. Sense degrades gracefully
+# without it (beeps and ultrasonic keep working), so if you would rather
+# hear "Sense ready." a few seconds sooner at boot, relax both of these to
+# plain network.target.
+Wants=network-online.target
+After=network-online.target sound.target
+
+# Fail with a clear message instead of restart-looping if the checkout is
+# missing or on a different path.
+ConditionPathExists=/home/sense/Sense/main.py
+
+[Service]
+Type=simple
+
+# Root, matching the `sudo -E python3 main.py` that works by hand: the
+# Robot HAT GPIO and the direct plughw ALSA device both want privileged
+# access. To run unprivileged instead you would need the sense user in the
+# gpio, spi, i2c, video and audio groups.
+User=root
+
+WorkingDirectory=/home/sense/Sense
+
+# --- environment ---------------------------------------------------------
+# systemd does NOT read .bashrc or any interactive shell config, so every
+# variable Sense needs is declared here.
+Environment=AUDIO_DEVICE=plughw:1,0
+Environment=ROBOT_HAT_GPIOCHIP=0
+
+# Unbuffered, so log lines reach journalctl as they happen rather than in
+# 4 KB blocks. Without this the startup report can appear minutes late.
+Environment=PYTHONUNBUFFERED=1
+
+# IMPORTANT: this is the equivalent of the -E in `sudo -E`, and it is the
+# most likely thing to break. google-genai was installed with
+#   pip3 install --user --break-system-packages google-genai
+# which puts it in /home/sense/.local/... . Running as root with the
+# default HOME=/root would look in /root/.local and NOT find it, so Gemini
+# would fail with "google-genai is not installed" while everything else
+# worked. Verify with the command in deploy/README.md.
+Environment=HOME=/home/sense
+
+# The Gemini API key is deliberately NOT here. main.py loads it from
+# /home/sense/Sense/.env.local, which stays gitignored and root-readable.
+
+# --- startup -------------------------------------------------------------
+# Brief pause so the CSI camera and the sound card have finished appearing
+# after boot. Without it a cold boot can report "Camera: FAIL" and then run
+# on happily without a camera, because Sense treats a missing camera as
+# non-fatal and so would never exit for systemd to restart. Lower or remove
+# once you have confirmed your own boot timing.
+ExecStartPre=/bin/sleep 5
+
+# --headless: no preview window, no HUD, no OpenCV GUI, no $DISPLAY needed.
+# Camera capture, ultrasonic, Gemini, beeps, TTS and logging all still run.
+ExecStart=/usr/bin/python3 -u /home/sense/Sense/main.py --headless
+
+# --- restart policy ------------------------------------------------------
+Restart=always
+RestartSec=5
+
+# Retry forever rather than giving up after N failures: this is a wearable
+# safety device and should always try to come back. The 5 s delay above is
+# what prevents a rapid restart loop.
+StartLimitIntervalSec=0
+
+# --- clean shutdown -----------------------------------------------------
+# SIGTERM is handled in main.py (install_signal_handlers), which raises
+# KeyboardInterrupt so the normal finally-block cleanup runs: beeper thread,
+# speech thread, gemini thread, GPIO release, audio close, camera stop.
+KillSignal=SIGTERM
+
+# "mixed" sends SIGTERM to the main process only, letting Python run its
+# own cleanup, then SIGKILLs anything left. Sense spawns short-lived aplay
+# and espeak-ng children, and this reaps any that outlive the parent.
+KillMode=mixed
+TimeoutStopSec=20
+
+# --- logging -------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sense
+
+[Install]
+# multi-user.target, NOT graphical.target: Sense starts on a machine with no
+# HDMI, no desktop session and nobody logged in.
+WantedBy=multi-user.target

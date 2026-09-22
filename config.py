@@ -380,36 +380,75 @@ GEMINI_DISABLE_THINKING = True
 GEMINI_PREWARM = True
 
 # --- Output ----------------------------------------------------------------
-GEMINI_MAX_DESCRIPTION_CHARS = 60
+# Roughly ten words. Generous enough that a useful phrase such as
+# "Table ahead, path clear on the right." is never cut off mid-sentence,
+# which would be worse than useless over TTS.
+GEMINI_MAX_DESCRIPTION_CHARS = 90
 
 # Do not reprint the same error more often than this (seconds). Keeps a
 # flapping network from filling the terminal.
 GEMINI_ERROR_REPEAT_S = 30.0
 
+# Log the model's reply EXACTLY as it arrived, before any cleanup, as
+#
+#     GEMINI RAW: 'Person ahead, slightly left.'
+#     AI ACCEPTED: Person ahead, slightly left.
+#
+# Printed as a repr so stray newlines, quotes and padding are visible.
+# Comparing the two lines tells you immediately whether a disappointing
+# description came from the model or from our own post-processing.
+GEMINI_LOG_RAW = True
+
 # The prompt. {distance_cm} is filled in from the ULTRASONIC reading, so the
-# model never has to guess distance - it only has to identify what the thing
-# is and where it sits in the frame.
+# model never has to guess distance.
+#
+# The sensor ALREADY tells the wearer that something is close. The camera's
+# entire job is to add what the sensor cannot know: WHAT the thing is.
+# So identification is the primary instruction here, and the generic
+# fallback is deliberately made unattractive.
+#
+# An earlier version of this prompt ended with "If the frame does not
+# clearly show which way is safe... reply exactly: Obstacle ahead." At
+# 25-50 cm an obstacle usually fills the frame, so that condition was
+# almost always true and the model took the sanctioned generic answer
+# nearly every time. The fix is to separate the two kinds of uncertainty:
+# not knowing which WAY to move is common and fine (just omit the
+# suggestion), whereas not knowing WHAT the object is should be rare.
 GEMINI_PROMPT = (
-    "You are the vision system of a navigation aid for a blind user.\n\n"
-    "An obstacle was detected approximately {distance_cm} cm directly ahead. "
-    "That distance is measured by an ultrasonic sensor and is accurate - do "
-    "NOT estimate or mention distance yourself.\n\n"
-    "Analyse this camera frame for navigation. Identify the important "
-    "obstacle and its position in the frame as left, centre or right. If the "
-    "image clearly supports it, add a short safe movement suggestion.\n\n"
-    "Reply with ONE phrase of at most six words. No distance, no commentary, "
-    "no explanation.\n\n"
-    "Prioritise: people, chairs, tables, walls, doorways, stairs, curbs, "
-    "poles, vehicles, pathways, and immediate trip or collision hazards.\n\n"
-    'Good replies: "Person ahead, slightly left." "Chair ahead, move right." '
-    '"Doorway ahead on the right." "Table leg ahead, move left." '
-    '"Wall ahead, move left."\n\n'
-    "CRITICAL: never invent a direction. If the frame does not clearly show "
-    "which way is safe, or the obstacle fills the view, reply exactly: "
-    '"Obstacle ahead."\n\n'
+    "You are the camera of a navigation aid for a blind user.\n\n"
+    "An ultrasonic sensor has already measured something {distance_cm} cm "
+    "directly ahead, so the wearer KNOWS an obstacle is there. That reading "
+    "is accurate - never estimate or mention distance.\n\n"
+    "Your job is the one thing the sensor cannot do: say WHAT it is.\n\n"
+    "Answer these in order:\n"
+    "1. WHAT is the most relevant object or hazard in the travel path? "
+    "Name it specifically - person, car, bicycle, chair, table, wall, "
+    "doorway, stairs, curb, pole, sign, bin, fence, hedge, counter, "
+    "trolley, glass door.\n"
+    "2. WHERE is it - on the left, directly ahead, or on the right?\n"
+    "3. WHAT should the wearer do? Add a short movement suggestion ONLY if "
+    "the image clearly shows a clear side. If it does not, simply leave the "
+    "suggestion out - still name the object and its direction.\n\n"
+    "Reply with ONE spoken phrase of about three to ten words. No distance, "
+    "no commentary, no explanation, no lists.\n\n"
+    'Good replies: "Person ahead, slightly left." "Car ahead on your right." '
+    '"Chair directly ahead, move left." '
+    '"Table ahead, path clear on the right." '
+    '"Doorway ahead on the left." "Wall directly ahead, turn right." '
+    '"Stairs going down ahead." "Pole ahead, slightly right."\n\n'
+    "IMPORTANT: naming the object is the whole point. Do not reply with a "
+    "generic phrase such as \"Obstacle ahead\" when the image lets you "
+    "identify the thing. Even a partial identification - a wall, a doorway, "
+    "furniture, a vehicle, a person - is far more useful than a generic "
+    "word. Being unable to suggest a direction is NOT a reason to withhold "
+    "the object name.\n\n"
+    "Equally, do not guess an object you cannot actually see. If the frame "
+    "is genuinely too dark, too blurred or too close to identify anything, "
+    'reply exactly: "Unknown object directly ahead."\n\n'
     "Do not identify who anyone is. Do not describe appearance, clothing, "
-    "age, gender, race or any other personal characteristic.\n\n"
-    'If there is no meaningful navigation obstacle, reply exactly: "Path clear."'
+    "age, gender, race or any other personal characteristic - "
+    '"Person ahead" is the correct level of detail for a human.\n\n'
+    'If nothing is actually blocking the path, reply exactly: "Path clear."'
 )
 
 
@@ -459,8 +498,9 @@ BEEP_MAX_INTERVAL_WHILE_SPEAKING_S = 0.40
 # is what shutdown uses. Nothing in the navigation logic mutes it.
 
 # Longest phrase we will speak. Anything longer is truncated - assistive
-# audio must stay short.
-SPEECH_MAX_CHARS = 60
+# audio must stay short. Kept in step with GEMINI_MAX_DESCRIPTION_CHARS so
+# an accepted description is never clipped on its way to the voice.
+SPEECH_MAX_CHARS = 90
 
 # Spoken once at startup, as the real playback test. If you do not hear
 # this in your headphones, the routing is wrong and startup will say so.

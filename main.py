@@ -35,6 +35,7 @@ down and cleaned up in a finally block either way.
 
 import argparse
 import collections
+import signal
 import sys
 import time
 
@@ -76,6 +77,43 @@ STATE_COLORS = {
 # ==========================================================================
 # Command line
 # ==========================================================================
+def install_signal_handlers():
+    """Make SIGTERM shut down as cleanly as Ctrl+C does.
+
+    Needed for headless operation under systemd: `systemctl stop` and a Pi
+    power-down both send SIGTERM, and Python's default action for SIGTERM is
+    to die immediately - skipping the `finally: shutdown(...)` block, so the
+    GPIO pins, the three worker threads, the speech engine and the camera
+    would never be released.
+
+    KeyboardInterrupt is raised because main() already handles it, so there
+    is exactly one shutdown path however the program is asked to stop. The
+    handler disarms itself so a second signal cannot interrupt the cleanup
+    it just triggered.
+    """
+    state = {"triggered": False}
+
+    def handle(signum, _frame):
+        if state["triggered"]:
+            return
+        state["triggered"] = True
+        print("")
+        print("Signal {} received - shutting down...".format(
+            signal.Signals(signum).name if hasattr(signal, "Signals")
+            else signum), flush=True)
+        raise KeyboardInterrupt("signal {}".format(signum))
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, handle)
+        except (ValueError, OSError, RuntimeError):
+            # Not the main thread, or unsupported on this platform.
+            pass
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Sense: camera + Robot HAT ultrasonic + headphone beeps + Gemini vision."
@@ -728,12 +766,16 @@ def shutdown(camera, sensor, monitor, player, beeper, vision=None,
         camera.close()
         print("  camera stopped")
 
-    try:
-        import cv2
-        cv2.destroyAllWindows()
-        cv2.waitKey(1)
-    except Exception:
-        pass
+    # Only if a preview actually ran. In headless mode cv2 was never
+    # imported, and calling window functions on a machine with no display
+    # is pointless at best.
+    if "cv2" in sys.modules:
+        try:
+            import cv2
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+        except Exception:
+            pass
 
     print("Done. Goodbye.")
 
@@ -743,6 +785,7 @@ def shutdown(camera, sensor, monitor, player, beeper, vision=None,
 # ==========================================================================
 def main(argv=None):
     args = parse_args(argv)
+    install_signal_handlers()
 
     print_banner()
     info = diagnostics.describe_platform()

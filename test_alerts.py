@@ -898,19 +898,15 @@ worker._process_request(worker._queue.get_nowait())
 check("the measured distance is passed through", captured["distance"], 42.0)
 check("and appears in the prompt", "42 cm" in captured["prompt"], True)
 check("the prompt forbids the model estimating distance",
-      "do NOT" in config.GEMINI_PROMPT and "estimate" in config.GEMINI_PROMPT,
+      "never estimate or mention distance" in config.GEMINI_PROMPT, True)
+check("the prompt asks for left / directly ahead / right",
+      "on the left, directly ahead, or on the right" in config.GEMINI_PROMPT,
       True)
-check("the prompt asks for left/centre/right",
-      "left, centre or right" in config.GEMINI_PROMPT, True)
-check("the prompt forbids inventing a direction",
-      "never invent a direction" in config.GEMINI_PROMPT, True)
-check("the prompt gives the no-information fallback",
-      '"Obstacle ahead."' in config.GEMINI_PROMPT, True)
 # The VISIBLE reply is bounded by the prompt and by _tidy(), not by the
 # token cap - the cap has to stay generous because Gemini 3 charges its
 # hidden thinking tokens against the same budget.
-check("the prompt asks for at most six words",
-      "at most six words" in config.GEMINI_PROMPT, True)
+check("the prompt asks for three to ten words",
+      "three to ten words" in config.GEMINI_PROMPT, True)
 check("and the reply is hard-truncated for display",
       len(vision.GeminiWorker._tidy("word " * 100)),
       config.GEMINI_MAX_DESCRIPTION_CHARS)
@@ -1707,6 +1703,209 @@ with contextlib.redirect_stdout(io.StringIO()):
 talker = _Talker()
 app.speak_new_guidance(worker, talker, 0)
 check("relevance still rejects a vanished obstacle", talker.said, [])
+
+
+# ==========================================================================
+print("\nThe prompt asks Gemini to identify WHAT is ahead")
+# ==========================================================================
+# Gemini was returning "Obstacle ahead." almost every time. The cause was
+# in the prompt, not in our code: it used to end with
+#
+#   "If the frame does not clearly show which way is safe, or the obstacle
+#    fills the view, reply exactly: Obstacle ahead."
+#
+# At 25-50 cm an obstacle usually DOES fill the view, so that condition was
+# nearly always true and the model took the sanctioned generic answer. The
+# fix separates two different uncertainties: not knowing which WAY to move
+# is common and fine, whereas not knowing WHAT the object is is rare.
+
+check("identification is stated as the primary job",
+      "say WHAT it is" in config.GEMINI_PROMPT, True)
+check("the prompt names concrete objects to look for",
+      all(word in config.GEMINI_PROMPT for word in
+          ("person", "car", "chair", "table", "wall", "doorway", "stairs",
+           "curb", "pole")), True)
+check("a generic reply is explicitly discouraged",
+      "Do not reply with a generic phrase" in config.GEMINI_PROMPT, True)
+check("and 'Obstacle ahead' is no longer the sanctioned fallback",
+      "reply exactly: \"Obstacle ahead.\"" in config.GEMINI_PROMPT, False)
+check("the unknown-object fallback is the new one",
+      "Unknown object directly ahead." in config.GEMINI_PROMPT, True)
+check("no safe direction must NOT withhold the object name",
+      "NOT a reason to withhold the object name" in config.GEMINI_PROMPT, True)
+check("hallucination is still forbidden",
+      "do not guess an object you cannot actually see" in config.GEMINI_PROMPT,
+      True)
+check("the movement suggestion stays conditional",
+      "ONLY if" in config.GEMINI_PROMPT, True)
+check("privacy rules are preserved",
+      all(word in config.GEMINI_PROMPT for word in
+          ("Do not identify who anyone is", "age, gender, race")), True)
+check("the path-clear reply is preserved",
+      "Path clear." in config.GEMINI_PROMPT, True)
+check("the ultrasonic distance is still injected",
+      "{distance_cm}" in config.GEMINI_PROMPT, True)
+
+
+# ==========================================================================
+print("\nCleanup never turns a real description into a generic one")
+# ==========================================================================
+# _tidy() strips whitespace and surrounding quotes, keeps the first line and
+# truncates. It must never substitute wording of its own - so a generic
+# phrase on the HUD came from the model, and the GEMINI RAW log proves it.
+
+DESIRED = [
+    "Person ahead, slightly left.",
+    "Car ahead on your right.",
+    "Chair directly ahead, move left.",
+    "Table ahead, path clear on the right.",
+    "Doorway ahead on the left.",
+    "Wall directly ahead, turn right.",
+    "Stairs going down ahead.",
+    "Pole ahead, slightly right.",
+    "Unknown object directly ahead.",
+    "Bicycle ahead, path clear on your left.",
+]
+
+for phrase in DESIRED:
+    check("tidy preserves: {}".format(phrase),
+          vision.GeminiWorker._tidy(phrase), phrase)
+    check("speech preserves: {}".format(phrase),
+          _clean_for_speech(phrase), phrase)
+
+check("no desired phrase is truncated by the description cap",
+      all(len(p) <= config.GEMINI_MAX_DESCRIPTION_CHARS for p in DESIRED), True)
+check("nor by the speech cap",
+      all(len(p) <= config.SPEECH_MAX_CHARS for p in DESIRED), True)
+check("the two caps agree so speech is never clipped",
+      config.SPEECH_MAX_CHARS >= config.GEMINI_MAX_DESCRIPTION_CHARS, True)
+check("a ten-word phrase fits",
+      len(vision.GeminiWorker._tidy(
+          "Wooden chair directly ahead, path appears clear on your right side")),
+      66)
+
+# Cleanup only removes noise, never meaning.
+check("surrounding quotes are stripped",
+      vision.GeminiWorker._tidy('"Car ahead on your right."'),
+      "Car ahead on your right.")
+check("padding is stripped",
+      vision.GeminiWorker._tidy("   Person ahead, slightly left.   "),
+      "Person ahead, slightly left.")
+check("a trailing explanation line is dropped, not the description",
+      vision.GeminiWorker._tidy(
+          "Chair directly ahead, move left.\nIt is a wooden dining chair."),
+      "Chair directly ahead, move left.")
+check("cleanup does not invent text for an empty reply",
+      vision.GeminiWorker._tidy(""), "")
+check("and an empty reply is never published as a description",
+      vision.GeminiWorker._tidy(None), "")
+
+
+# ==========================================================================
+print("\nGEMINI RAW logging distinguishes model output from our cleanup")
+# ==========================================================================
+check("raw logging is enabled", config.GEMINI_LOG_RAW, True)
+
+
+def _raw_and_accepted(raw_reply):
+    """Return (GEMINI RAW line, AI ACCEPTED line) for a given model reply."""
+    w = vision.GeminiWorker()
+    w._latest_request_id = 1
+    w._encode_jpeg = staticmethod(lambda frame: b"jpeg")
+    w._call_gemini = lambda jpeg, distance: raw_reply
+    w.note_current_state(42.0, "WARNING")
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        w._process_request(vision.AiRequest(
+            FakeFrame(), 42.0, "WARNING", time.monotonic(), 1, "band"))
+    raw_line = accepted_line = None
+    for line in buffer.getvalue().splitlines():
+        if line.startswith("GEMINI RAW:"):
+            raw_line = line
+        elif line.startswith("AI ACCEPTED:"):
+            accepted_line = line.split("   [")[0]
+    return raw_line, accepted_line, w.snapshot()
+
+
+raw_line, accepted_line, snap = _raw_and_accepted("Person ahead, slightly left.")
+check("the raw model reply is logged",
+      raw_line, "GEMINI RAW: 'Person ahead, slightly left.'")
+check("the accepted text is logged",
+      accepted_line, "AI ACCEPTED: Person ahead, slightly left.")
+check("and they match when cleanup changed nothing",
+      snap["accepted_text"], "Person ahead, slightly left.")
+
+# When cleanup DOES change something, both lines make it obvious.
+raw_line, accepted_line, snap = _raw_and_accepted(
+    '  "Car ahead on your right."  ')
+check("raw shows the model's padding and quotes",
+      raw_line, 'GEMINI RAW: \'  "Car ahead on your right."  \'')
+check("accepted shows the cleaned version",
+      accepted_line, "AI ACCEPTED: Car ahead on your right.")
+check("so the difference is attributable to cleanup, not the model",
+      snap["accepted_text"], "Car ahead on your right.")
+
+# A specific identification must survive all the way to speech, even in
+# DANGER, where guidance is now allowed to speak.
+worker = vision.GeminiWorker()
+worker._latest_request_id = 1
+worker._encode_jpeg = staticmethod(lambda frame: b"jpeg")
+worker._call_gemini = lambda jpeg, distance: "Chair directly ahead, move left."
+worker.note_current_state(18.0, "DANGER")
+with contextlib.redirect_stdout(io.StringIO()):
+    worker._process_request(vision.AiRequest(
+        FakeFrame(), 18.0, "DANGER", time.monotonic(), 1, "band"))
+talker = _SpyTalker()
+app.speak_new_guidance(worker, talker, 0)
+check("a specific identification is spoken unchanged in DANGER",
+      talker.said, ["Chair directly ahead, move left."])
+
+
+# ==========================================================================
+print("\nHeadless operation needs no display, and stops cleanly")
+# ==========================================================================
+# The production device has no HDMI, no keyboard and no desktop session, so
+# --headless must not touch OpenCV's GUI, the HUD module, or $DISPLAY. And
+# systemd stops it with SIGTERM, whose default action would kill Python
+# outright and skip the cleanup that releases the GPIO and the threads.
+
+check("main.py imports no GUI module at load time",
+      "cv2" in sys.modules or "ui" in sys.modules, False)
+check("a SIGTERM handler installer exists",
+      callable(getattr(app, "install_signal_handlers", None)), True)
+check("the headless loop exists", callable(app.run_headless_loop), True)
+check("--headless is a real flag",
+      app.parse_args(["--headless"]).headless, True)
+
+service = pathlib.Path("deploy/sense.service").read_text(encoding="utf-8")
+check("the unit runs Sense headless", "--headless" in service, True)
+check("the unit provides AUDIO_DEVICE",
+      "Environment=AUDIO_DEVICE=plughw:1,0" in service, True)
+check("the unit provides ROBOT_HAT_GPIOCHIP",
+      "Environment=ROBOT_HAT_GPIOCHIP=0" in service, True)
+check("the unit sets HOME so pip --user packages resolve",
+      "Environment=HOME=/home/sense" in service, True)
+check("the unit unbuffers output for journalctl",
+      "PYTHONUNBUFFERED=1" in service, True)
+check("the unit uses the project directory",
+      "WorkingDirectory=/home/sense/Sense" in service, True)
+check("the unit restarts on crash", "Restart=always" in service, True)
+check("with a delay that prevents a rapid loop",
+      "RestartSec=5" in service, True)
+check("the unit stops with SIGTERM so cleanup runs",
+      "KillSignal=SIGTERM" in service, True)
+check("and allows time for that cleanup",
+      "TimeoutStopSec=20" in service, True)
+check("the unit starts WITHOUT a graphical session",
+      "WantedBy=multi-user.target" in service, True)
+check("and never requires graphical.target",
+      "graphical.target" in service, False)
+check("the unit waits for the network for Gemini",
+      "network-online.target" in service, True)
+check("the API key is NOT in the unit file",
+      "GEMINI_API_KEY" in service, False)
+check("the key still comes from .env.local",
+      ".env.local" in service, True)
 
 
 # ==========================================================================

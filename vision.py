@@ -771,6 +771,13 @@ class GeminiWorker(threading.Thread):
             return
         api_ms = (time.monotonic() - api_started) * 1000.0
 
+        # The model's words, before we touch them. Compare with the
+        # AI ACCEPTED line below to see whether our cleanup changed
+        # anything - _tidy() only strips whitespace and quotes and
+        # truncates, and never substitutes a phrase of its own.
+        if config.GEMINI_LOG_RAW:
+            print("GEMINI RAW: {!r}".format(raw), flush=True)
+
         with self._lock:
             self._last_encode_ms = encode_ms
             self._last_api_ms = api_ms
@@ -964,7 +971,14 @@ class GeminiWorker(threading.Thread):
 
     @staticmethod
     def _tidy(text):
-        """Collapse a model reply into one short, clean line."""
+        """Collapse a model reply into one short, clean line.
+
+        Strips surrounding whitespace and quotes, keeps the first line, and
+        truncates to GEMINI_MAX_DESCRIPTION_CHARS. It NEVER substitutes
+        wording of its own - a generic description reaching the HUD came
+        from the model, not from here. The GEMINI RAW log line above exists
+        so that can be confirmed rather than argued about.
+        """
         if not text:
             return ""
         first_line = str(text).strip().splitlines()[0] if str(text).strip() else ""
