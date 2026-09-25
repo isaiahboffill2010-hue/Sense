@@ -63,6 +63,7 @@
 #     python3 smoke_test_gemini.py
 #
 google-genai>=1.0.0
+pocketsphinx>=5.0.0
 #
 # Do NOT install `google-generativeai` - that SDK is deprecated.
 #

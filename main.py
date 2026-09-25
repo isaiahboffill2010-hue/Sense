@@ -162,6 +162,11 @@ def dump_state(reason="requested"):
             add("speech spoken", speech.spoken_count)
             add("speech suppressed", speech.suppressed_count)
             add("speech error", speech.error)
+        assistant = RUNTIME.get("assistant")
+        if assistant is not None:
+            add("voice assistant thread", assistant.is_alive())
+            add("voice assistant state", assistant.state)
+            add("voice assistant error", assistant.error)
         add("audio device", config.AUDIO_DEVICE or "system default")
 
         # --- gemini -----------------------------------------------------
@@ -275,6 +280,10 @@ def parse_args(argv=None):
         help="run even if this does not look like a Raspberry Pi (expect "
              "real import errors; nothing is simulated)",
     )
+    parser.add_argument("--list-microphones", action="store_true",
+                        help="list ALSA recording devices and exit")
+    parser.add_argument("--test-assistant", action="store_true",
+                        help="run the voice assistant without camera or sensors")
     return parser.parse_args(argv)
 
 
@@ -693,6 +702,26 @@ def start_ultrasonic(args, states):
     return sensor, monitor
 
 
+def start_assistant(args, speech, beeper, gemini=None):
+    """Start voice interaction independently of the safety path."""
+    if not config.ASSISTANT_ENABLED:
+        print("Voice assistant: SKIPPED (ASSISTANT_ENABLED=False)")
+        return None
+    if speech is None:
+        print("VOICE ERROR: speech unavailable; assistant disabled")
+        return None
+    try:
+        from assistant import VoiceAssistant
+        worker = VoiceAssistant(speech, beeper, gemini_worker=gemini).open()
+        worker.start()
+        print("Voice assistant: OK - local PocketSphinx wake word")
+        return worker
+    except Exception as exc:
+        print("VOICE ERROR: {}: {}".format(type(exc).__name__, exc), flush=True)
+        print("  Safety sensing continues without voice interaction.")
+        return None
+
+
 # ==========================================================================
 # Loops
 # ==========================================================================
@@ -877,10 +906,14 @@ def _short_state(state):
 # Shutdown
 # ==========================================================================
 def shutdown(camera, sensor, monitor, player, beeper, vision=None,
-             speech=None, speech_player=None, reader=None):
+             speech=None, speech_player=None, reader=None, assistant=None):
     """Stop everything, in the safe order, and never raise while doing it."""
     print("")
     print("Cleaning up...")
+
+    if assistant is not None:
+        assistant.stop()
+        print("  voice assistant stopped")
 
     if beeper is not None:
         beeper.stop()
@@ -953,6 +986,22 @@ def main(argv=None):
     args = parse_args(argv)
     install_signal_handlers()
 
+    if args.list_microphones:
+        try:
+            from assistant import list_recording_devices
+            print(list_recording_devices())
+            return 0
+        except Exception as exc:
+            print("MIC ERROR: {}".format(exc))
+            return 1
+
+    if args.test_assistant:
+        # Reuse the production Gemini, TTS, beep and assistant classes while
+        # deliberately leaving camera/GPIO untouched.
+        args.skip_camera = True
+        args.skip_ultrasonic = True
+        args.headless = True
+
     print_banner()
     info = diagnostics.describe_platform()
     diagnostics.print_platform_report(info)
@@ -987,6 +1036,7 @@ def main(argv=None):
     vision = None
     speech = None
     speech_player = None
+    assistant = None
     exit_code = 0
 
     try:
@@ -1008,6 +1058,7 @@ def main(argv=None):
             vision = start_vision(args, states)
 
         speech_player, speech = start_speech(args, states)
+        assistant = start_assistant(args, speech, beeper, vision)
 
         print("-" * 62)
         print("Camera     : {}".format(states["Camera"][0]))
@@ -1043,6 +1094,7 @@ def main(argv=None):
             "started_at": time.monotonic(), "sensor": sensor,
             "monitor": monitor, "reader": reader, "policy": policy,
             "beeper": beeper, "speech": speech, "vision": vision,
+            "assistant": assistant,
         })
 
         ran_preview = False
@@ -1059,7 +1111,7 @@ def main(argv=None):
         print("Ctrl+C received - shutting down...")
     finally:
         shutdown(camera, sensor, monitor, player, beeper, vision,
-                 speech, speech_player, reader)
+                 speech, speech_player, reader, assistant)
 
     # Sense is a long-running service. Reaching here having never entered a
     # processing loop means something returned that should not have, and it

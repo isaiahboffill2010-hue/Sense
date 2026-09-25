@@ -31,6 +31,26 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
+def _load_local_environment():
+    """Load simple KEY=VALUE settings before module constants are resolved."""
+    path = PROJECT_ROOT / ".env.local"
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_local_environment()
+
+
 # ==========================================================================
 # 1. ULTRASONIC SENSOR WIRING (SunFounder Robot HAT digital ports)
 # ==========================================================================
@@ -591,3 +611,37 @@ SPEECH_MAX_CHARS = 90
 # Spoken once at startup, as the real playback test. If you do not hear
 # this in your headphones, the routing is wrong and startup will say so.
 SPEECH_STARTUP_PHRASE = "Sense ready."
+
+
+# ========================================================================== 
+# 8. VOICE ASSISTANT (local wake word/VAD, Gemini transcription + answers)
+# ========================================================================== 
+# Environment values are read here so main.py and systemd use one source of
+# truth.  An empty input device means ALSA's default capture device; unlike
+# AUDIO_DEVICE, it is never guessed from a card number.
+ASSISTANT_ENABLED = os.environ.get("ASSISTANT_ENABLED", "1").lower() not in (
+    "0", "false", "no", "off")
+ASSISTANT_WAKE_PHRASE = os.environ.get("ASSISTANT_WAKE_PHRASE", "hey sense")
+MIC_DEVICE = os.environ.get("MIC_DEVICE", "").strip() or None
+ASSISTANT_SAMPLE_RATE = 16000
+ASSISTANT_CHUNK_MS = 100
+ASSISTANT_SILENCE_TIMEOUT_S = float(os.environ.get(
+    "ASSISTANT_SILENCE_TIMEOUT_S", "1.3"))
+ASSISTANT_SPEECH_START_TIMEOUT_S = float(os.environ.get(
+    "ASSISTANT_SPEECH_START_TIMEOUT_S", "6.0"))
+ASSISTANT_MAX_RECORDING_S = float(os.environ.get(
+    "ASSISTANT_MAX_RECORDING_S", "15.0"))
+ASSISTANT_ENERGY_THRESHOLD = int(os.environ.get(
+    "ASSISTANT_ENERGY_THRESHOLD", "500"))
+ASSISTANT_WAKE_THRESHOLD = float(os.environ.get(
+    "ASSISTANT_WAKE_THRESHOLD", "1e-18"))
+ASSISTANT_GEMINI_MODEL = os.environ.get(
+    "ASSISTANT_GEMINI_MODEL", GEMINI_MODEL)
+ASSISTANT_MAX_HISTORY_TURNS = int(os.environ.get(
+    "ASSISTANT_MAX_HISTORY_TURNS", "3"))
+ASSISTANT_SYSTEM_PROMPT = (
+    "You are Sense, a concise voice assistant inside an assistive wearable. "
+    "Respond naturally for spoken audio. Keep ordinary answers brief unless "
+    "the user asks for more detail. Do not use markdown."
+)
+ASSISTANT_ACK_TONE = "warning"
