@@ -322,6 +322,7 @@ class UltrasonicMonitor(threading.Thread):
         self._lock = threading.Lock()
 
         self._distance_cm = None      # last good reading, or None
+        self._measured_at = None      # monotonic timestamp of last good reading
         self._out_of_range = False    # reading outside the sensor's rated range
         self._error = None            # text of the most recent failure
         self._consecutive_errors = 0
@@ -339,6 +340,7 @@ class UltrasonicMonitor(threading.Thread):
             else:
                 with self._lock:
                     self._distance_cm = distance
+                    self._measured_at = time.monotonic()
                     self._out_of_range = (
                         distance > config.SENSOR_MAX_DISTANCE_CM
                         or distance < config.SENSOR_MIN_DISTANCE_CM
@@ -373,6 +375,8 @@ class UltrasonicMonitor(threading.Thread):
             healthy = self._consecutive_errors < config.SENSOR_ERRORS_BEFORE_FAIL
             return {
                 "distance_cm": self._distance_cm,
+                "age_s": (None if self._measured_at is None else
+                           time.monotonic() - self._measured_at),
                 "out_of_range": self._out_of_range,
                 "error": self._error,
                 "healthy": healthy,

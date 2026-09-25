@@ -702,7 +702,8 @@ def start_ultrasonic(args, states):
     return sensor, monitor
 
 
-def start_assistant(args, speech, beeper, gemini=None):
+def start_assistant(args, speech, beeper, gemini=None, camera_reader=None,
+                    ultrasonic_monitor=None):
     """Start voice interaction independently of the safety path."""
     if not config.ASSISTANT_ENABLED:
         print("Voice assistant: SKIPPED (ASSISTANT_ENABLED=False)")
@@ -712,7 +713,11 @@ def start_assistant(args, speech, beeper, gemini=None):
         return None
     try:
         from assistant import VoiceAssistant
-        worker = VoiceAssistant(speech, beeper, gemini_worker=gemini).open()
+        worker = VoiceAssistant(
+            speech, beeper, gemini_worker=gemini,
+            camera_reader=camera_reader,
+            ultrasonic_monitor=ultrasonic_monitor,
+        ).open()
         worker.start()
         print("Voice assistant: OK - local PocketSphinx wake word")
         return worker
@@ -1057,8 +1062,14 @@ def main(argv=None):
         else:
             vision = start_vision(args, states)
 
+        if camera is not None:
+            from hardware.camera import CameraReader
+            reader = CameraReader(camera)
+            reader.start()
+
         speech_player, speech = start_speech(args, states)
-        assistant = start_assistant(args, speech, beeper, vision)
+        assistant = start_assistant(
+            args, speech, beeper, vision, reader, monitor)
 
         print("-" * 62)
         print("Camera     : {}".format(states["Camera"][0]))
@@ -1081,12 +1092,6 @@ def main(argv=None):
 
         # Capture on its own thread, so the beeps can never sit behind a
         # blocking camera call.
-        reader = None
-        if camera is not None:
-            from hardware.camera import CameraReader
-            reader = CameraReader(camera)
-            reader.start()
-
         # One policy shared by both loops: it owns all the alert state.
         policy = alerts.AlertPolicy()
 

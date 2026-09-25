@@ -18,6 +18,18 @@ class FakeMic:
     def read(self): return next(self.chunks)
 
 
+class FakeCameraReader:
+    def __init__(self, frame=None): self.frame = frame; self.calls = 0
+    def fresh_frame(self): self.calls += 1; return self.frame
+
+
+class FakeUltrasonicMonitor:
+    def __init__(self, distance=80.0, age=0.1):
+        self.distance = distance; self.age = age
+    def snapshot(self):
+        return {"distance_cm": self.distance, "age_s": self.age}
+
+
 class AssistantTests(unittest.TestCase):
     def setUp(self): self.voice = assistant.VoiceAssistant(FakeSpeech())
 
@@ -49,6 +61,56 @@ class AssistantTests(unittest.TestCase):
                                b"\x20\x00" * 160, b"\x00\x00" * 160]
                     data = self.voice._record_utterance(FakeMic(packets))
                     self.assertGreater(len(data), 0)
+
+    def test_speech_start_timeout_is_separate_from_recording_timeout(self):
+        with mock.patch.object(assistant.config, "ASSISTANT_SPEECH_START_TIMEOUT_S", 0):
+            with mock.patch.object(assistant.config, "ASSISTANT_MAX_RECORDING_S", 99):
+                self.assertEqual(self.voice._record_utterance(
+                    FakeMic([b"\0\0" * 160])), b"")
+
+    def test_end_of_speech_uses_continuous_silence(self):
+        packets = [b"\x20\x00" * 160] + [b"\0\0" * 160] * 11
+        with mock.patch.object(assistant.config, "ASSISTANT_ENERGY_THRESHOLD", 10):
+            with mock.patch.object(assistant.config, "ASSISTANT_SILENCE_TIMEOUT_S", 1.0):
+                data = self.voice._record_utterance(FakeMic(packets))
+        self.assertGreater(len(data), 0)
+        self.assertIsNotNone(self.voice._end_of_speech_at)
+
+    def test_local_routes_cover_normal_visual_distance_and_combined(self):
+        self.assertEqual(self.voice._route("What's the capital of France?"), "normal")
+        self.assertEqual(self.voice._route("Where am I?"), "vision")
+        self.assertEqual(self.voice._route("How far away is the thing?"), "distance")
+        self.assertEqual(self.voice._route(
+            "What is that object and how far away is it?"), "vision+distance")
+
+    def test_where_am_i_uses_a_fresh_camera_frame(self):
+        camera = FakeCameraReader(frame=object())
+        voice = assistant.VoiceAssistant(
+            FakeSpeech(), camera_reader=camera,
+            gemini_worker=mock.Mock())
+        voice._vision_answer = mock.Mock(return_value="You appear to be indoors.")
+        self.assertEqual(voice._answer_routed("Where am I?", "vision"),
+                         "You appear to be indoors.")
+        self.assertEqual(camera.calls, 1)
+
+    def test_distance_and_combined_routes_require_fresh_ultrasonic(self):
+        monitor = FakeUltrasonicMonitor(distance=40.0)
+        voice = assistant.VoiceAssistant(FakeSpeech(), ultrasonic_monitor=monitor)
+        self.assertIn("40 centimeters", voice._answer_routed(
+            "How far away is it?", "distance"))
+        monitor.age = 2.0
+        self.assertIn("can't determine", voice._answer_routed(
+            "How far away is it?", "distance"))
+
+    def test_visual_unavailable_and_visual_followup_keep_context(self):
+        voice = assistant.VoiceAssistant(
+            FakeSpeech(), camera_reader=FakeCameraReader(frame=None))
+        self.assertIn("can't currently see", voice._answer_routed(
+            "What is in front of me?", "vision"))
+        voice._history.extend((("user", "What's in front of me?"),
+                               ("model", "A red chair.")))
+        self.assertIn("What's in front", voice._history_text())
+        self.assertEqual(voice._route("What color did you say it was?"), "vision")
 
     def _run_failure(self, answer_error=False):
         self.voice._record_utterance = mock.Mock(return_value=b"audio")

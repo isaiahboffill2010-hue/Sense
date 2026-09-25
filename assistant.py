@@ -6,12 +6,10 @@ inside this worker so the safety threads remain independent.
 """
 import audioop
 import collections
-import math
 import os
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import wave
@@ -101,18 +99,22 @@ class VoiceAssistant(threading.Thread):
               "THINKING", "SPEAKING", "STOPPED")
 
     def __init__(self, speech, beeper=None, microphone_factory=MicrophoneStream,
-                 decoder_factory=None, gemini_worker=None):
+                 decoder_factory=None, gemini_worker=None, camera_reader=None,
+                 ultrasonic_monitor=None):
         super().__init__(name="voice-assistant", daemon=True)
         self.speech, self.beeper = speech, beeper
         self._microphone_factory = microphone_factory
         self._decoder_factory = decoder_factory or self._make_decoder
         self._gemini = gemini_worker
+        self._camera_reader = camera_reader
+        self._ultrasonic_monitor = ultrasonic_monitor
         self._stop_event = threading.Event()
         self._active_mic = None
         self._state = "STOPPED"
         self._lock = threading.Lock()
         self._history = collections.deque(
             maxlen=max(1, config.ASSISTANT_MAX_HISTORY_TURNS) * 2)
+        self._end_of_speech_at = None
         self.error = None
 
     @property
@@ -183,11 +185,9 @@ class VoiceAssistant(threading.Thread):
         decoder.end_utt()
 
     def _handle_request(self, mic):
+        request_started = time.monotonic()
         self._set_state("WAKE_DETECTED")
         print("MIC DEVICE: {}".format(config.MIC_DEVICE or "ALSA default"), flush=True)
-        if self.beeper is not None:
-            self.beeper.play_once(config.ASSISTANT_ACK_TONE)
-            time.sleep(config.BEEP_DURATION_S + 0.08)
         self._set_state("LISTENING")
         print("LISTENING...", flush=True)
         pcm = self._record_utterance(mic)
@@ -197,18 +197,25 @@ class VoiceAssistant(threading.Thread):
         path = pcm_to_wav(pcm, "/tmp/sense-last-request.wav")
         try:
             self._set_state("TRANSCRIBING")
+            print("STT START", flush=True)
+            stt_started = time.monotonic()
             text = self._transcribe(path)
-        finally:
-            pass
+            print("STT COMPLETE: {:.2f}s".format(
+                time.monotonic() - stt_started), flush=True)
+        except Exception:
+            print("STT COMPLETE: {:.2f}s".format(
+                time.monotonic() - stt_started), flush=True)
+            raise
         text = self._clean_transcript(text)
         if not text:
             print("STT ERROR: no usable speech", flush=True)
             self._say_and_wait("I didn't catch that.")
             return
         print("HEARD: {}".format(text), flush=True)
-        self._set_state("THINKING")
         try:
-            answer = self._answer(text)
+            route = self._route(text)
+            print("ROUTE: {}".format(route), flush=True)
+            answer = self._answer_routed(text, route)
         except Exception as exc:
             print("GEMINI ERROR: {}: {}".format(type(exc).__name__, exc),
                   flush=True)
@@ -216,7 +223,7 @@ class VoiceAssistant(threading.Thread):
             return
         print("GEMINI: {}".format(answer), flush=True)
         self._history.extend((("user", text), ("model", answer)))
-        self._say_and_wait(answer)
+        self._say_and_wait(answer, request_started)
 
     def _record_utterance(self, mic):
         chunk_s = config.ASSISTANT_CHUNK_MS / 1000.0
@@ -235,6 +242,9 @@ class VoiceAssistant(threading.Thread):
                 data = mic.read()
             except (StopIteration, OSError, EOFError):
                 print("MIC ERROR: microphone stream ended unexpectedly", flush=True)
+                if speech_started:
+                    self._end_of_speech_at = time.monotonic()
+                    print("END OF SPEECH", flush=True)
                 break
             elapsed = time.monotonic() - started
             rms = audioop.rms(data, 2) if data else 0
@@ -261,9 +271,13 @@ class VoiceAssistant(threading.Thread):
                 else:
                     silence += chunk_s
                     if silence >= config.ASSISTANT_SILENCE_TIMEOUT_S:
+                        self._end_of_speech_at = time.monotonic()
                         print("SPEECH END: {:.2f}s".format(elapsed), flush=True)
+                        print("END OF SPEECH", flush=True)
                         break
             if elapsed >= config.ASSISTANT_MAX_RECORDING_S:
+                self._end_of_speech_at = time.monotonic()
+                print("END OF SPEECH", flush=True)
                 print("SPEECH: maximum recording duration reached", flush=True)
                 break
 
@@ -294,6 +308,117 @@ class VoiceAssistant(threading.Thread):
             return ""
         return cleaned
 
+    @staticmethod
+    def _route(text):
+        """Choose a local route without spending a Gemini request."""
+        lowered = text.lower()
+        visual = any(phrase in lowered for phrase in (
+            "where am i", "what's in front", "what is in front",
+            "what am i looking", "what room", "where is the door",
+            "what objects", "what is around", "what's around",
+            "read that sign", "read the sign", "what color", "what colour",
+            "is there a", "is anything blocking", "can you see",
+        ))
+        distance = any(phrase in lowered for phrase in (
+            "how far", "how close", "distance", "centimeter", "centimetre",
+            "meter away", "metre away", "meters away", "metres away",
+        ))
+        object_question = any(phrase in lowered for phrase in (
+            "what is", "what's", "what object", "what thing", "identify",
+        ))
+        if visual and distance or (distance and object_question):
+            return "vision+distance"
+        if visual:
+            return "vision"
+        if distance:
+            return "distance"
+        return "normal"
+
+    def _distance_snapshot(self):
+        if self._ultrasonic_monitor is None:
+            return None
+        snapshot = self._ultrasonic_monitor.snapshot()
+        distance = snapshot.get("distance_cm")
+        age = snapshot.get("age_s")
+        if distance is None or age is None or age > config.ASSISTANT_DISTANCE_MAX_AGE_S:
+            return None
+        return distance
+
+    def _fresh_frame(self):
+        if self._camera_reader is None:
+            return None
+        return self._camera_reader.fresh_frame()
+
+    def _history_text(self):
+        return "\n".join("{}: {}".format(role, value)
+                          for role, value in self._history)
+
+    def _answer_routed(self, text, route):
+        self._set_state("THINKING")
+        distance = self._distance_snapshot() if route in (
+            "distance", "vision+distance") else None
+        if route in ("distance", "vision+distance") and distance is None:
+            if route == "distance":
+                return "I can't determine the distance right now."
+            frame = self._fresh_frame()
+            if frame is None:
+                return ("Sense can't currently see the environment, and I "
+                        "can't determine the distance right now.")
+            answer = self._vision_answer(text, frame)
+            return answer + " I can't determine the distance right now."
+
+        if route == "distance":
+            return "The object is approximately {:.0f} centimeters away.".format(
+                distance)
+
+        if route in ("vision", "vision+distance"):
+            frame = self._fresh_frame()
+            if frame is None:
+                return "Sense can't currently see the environment."
+            if self._gemini is None:
+                return "Sense can't currently analyze the camera view."
+            return self._vision_answer(text, frame, distance)
+        return self._answer(text)
+
+    def _vision_answer(self, text, frame, distance=None):
+        from google.genai import types
+        started = time.monotonic()
+        print("GEMINI START", flush=True)
+        prompt = (
+            "You are Sense, a concise visual assistant for a blind user. "
+            "Answer the user's actual question using only the current image. "
+            "Never invent objects, locations, text, colors, distances, GPS, "
+            "street names, or addresses. If the image is insufficient, say "
+            "that clearly. Keep the spoken answer to one to three concise "
+            "sentences. Use the recent conversation only to resolve follow-up "
+            "references such as 'it', 'that', or 'the door'.\n\n"
+            "Recent conversation:\n{}\n\nUser question: {}"
+        ).format(self._history_text() or "(none)", text)
+        if distance is not None:
+            prompt += ("\n\nThe ultrasonic sensor currently measures {:.0f} "
+                       "centimeters directly ahead. Use this real reading "
+                       "when the user asks how far; do not estimate it from "
+                       "the image.").format(distance)
+        response = self._gemini._client.models.generate_content(
+            model=config.ASSISTANT_GEMINI_MODEL,
+            contents=[types.Part.from_bytes(data=self._frame_bytes(frame),
+                                             mime_type="image/jpeg"), prompt],
+        )
+        answer = " ".join((getattr(response, "text", "") or "").split())
+        if not answer:
+            raise RuntimeError("empty visual response")
+        print("GEMINI COMPLETE: {:.2f}s".format(
+            time.monotonic() - started), flush=True)
+        return answer
+
+    @staticmethod
+    def _frame_bytes(frame):
+        try:
+            return vision.GeminiWorker._encode_jpeg(frame)
+        except Exception as exc:
+            raise RuntimeError("could not encode current camera frame: {}".format(
+                exc)) from exc
+
     def _transcribe(self, path):
         from google.genai import types
         with open(path, "rb") as source:
@@ -312,8 +437,9 @@ class VoiceAssistant(threading.Thread):
 
     def _answer(self, text):
         from google.genai import types
-        context = "\n".join("{}: {}".format(role, value)
-                            for role, value in self._history)
+        started = time.monotonic()
+        print("GEMINI START", flush=True)
+        context = self._history_text()
         prompt = (config.ASSISTANT_SYSTEM_PROMPT + "\n" + context +
                   "\nUser: " + text + "\nSense:")
         print("GEMINI REQUEST: {}".format(text), flush=True)
@@ -325,9 +451,11 @@ class VoiceAssistant(threading.Thread):
         answer = " ".join((getattr(response, "text", "") or "").split())
         if not answer:
             raise RuntimeError("empty response")
+        print("GEMINI COMPLETE: {:.2f}s".format(
+            time.monotonic() - started), flush=True)
         return answer
 
-    def _say_and_wait(self, text):
+    def _say_and_wait(self, text, response_started_at=None):
         self._set_state("SPEAKING")
         if self.speech is None or not self.speech.say(text):
             print("AUDIO ERROR: speech unavailable", flush=True); return
@@ -335,7 +463,14 @@ class VoiceAssistant(threading.Thread):
         began = False
         while time.monotonic() < deadline and not self._stop_event.is_set():
             active = self.speech.speaking
-            began = began or active
+            if active and not began:
+                began = True
+                print("TTS START", flush=True)
+                if response_started_at is not None:
+                    print("TOTAL RESPONSE LATENCY: {:.2f}s".format(
+                        time.monotonic() - getattr(
+                            self, "_end_of_speech_at", response_started_at)),
+                        flush=True)
             if began and not active:
                 print("SPEECH COMPLETE", flush=True); return
             time.sleep(0.05)

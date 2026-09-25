@@ -628,9 +628,9 @@ ASSISTANT_CHUNK_MS = 100
 ASSISTANT_PRE_SPEECH_BUFFER_S = float(os.environ.get(
     "ASSISTANT_PRE_SPEECH_BUFFER_S", "0.55"))
 ASSISTANT_SILENCE_TIMEOUT_S = float(os.environ.get(
-    "ASSISTANT_SILENCE_TIMEOUT_S", "1.6"))
+    "ASSISTANT_SILENCE_TIMEOUT_S", "1.0"))
 ASSISTANT_SPEECH_START_TIMEOUT_S = float(os.environ.get(
-    "ASSISTANT_SPEECH_START_TIMEOUT_S", "8.0"))
+    "ASSISTANT_SPEECH_START_TIMEOUT_S", "10.0"))
 ASSISTANT_MAX_RECORDING_S = float(os.environ.get(
     "ASSISTANT_MAX_RECORDING_S", "18.0"))
 ASSISTANT_MIN_SPEECH_SECONDS = float(os.environ.get(
@@ -645,12 +645,14 @@ ASSISTANT_MAX_HISTORY_TURNS = int(os.environ.get(
     "ASSISTANT_MAX_HISTORY_TURNS", "3"))
 ASSISTANT_SYSTEM_PROMPT = (
     "You are Sense, a concise voice assistant inside an assistive wearable. "
-    "Respond naturally for spoken audio. Keep ordinary answers brief unless "
-    "the user asks for more detail. Do not use markdown."
+    "Respond naturally for spoken audio in one to three sentences. Keep "
+    "ordinary answers brief unless the user asks for more detail. Do not use "
+    "markdown."
 )
 ASSISTANT_STT_PROMPT = (
     "Transcribe the user's spoken request accurately. Return only the words "
     "spoken by the user. Do not answer the request, describe the audio, add "
     "timestamps, or add commentary."
 )
-ASSISTANT_ACK_TONE = "warning"
+ASSISTANT_DISTANCE_MAX_AGE_S = float(os.environ.get(
+    "ASSISTANT_DISTANCE_MAX_AGE_S", "1.0"))
