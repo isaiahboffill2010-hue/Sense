@@ -8,6 +8,7 @@ import audioop
 import collections
 import os
 import re
+import select
 import shutil
 import subprocess
 import threading
@@ -69,6 +70,17 @@ class MicrophoneStream:
             raise MicrophoneError("device disconnected or capture failed: {}".
                                   format(" ".join(detail.split())))
         return data
+
+    def discard_pending(self):
+        """Drop audio captured while Sense was speaking its wake reply."""
+        if self.process is None or self.process.stdout is None:
+            return
+        try:
+            fd = self.process.stdout.fileno()
+            while select.select([fd], [], [], 0)[0]:
+                os.read(fd, self.chunk_bytes)
+        except (OSError, ValueError):
+            pass
 
     def close(self):
         process, self.process = self.process, None
@@ -178,15 +190,25 @@ class VoiceAssistant(threading.Thread):
             if decoder.hyp() is not None:
                 decoder.end_utt()
                 print("WAKE: Hey Sense detected", flush=True)
-                self._handle_request(mic)
+                self._handle_wake_detected(mic)
                 decoder.start_utt()
                 self._set_state("WAITING")
                 print("WAKE: waiting", flush=True)
         decoder.end_utt()
 
+    def _handle_wake_detected(self, mic):
+        self._set_state("WAKE_DETECTED")
+        print("WAKE ACK START: Yes, sir?", flush=True)
+        if not self._say_and_wait("Yes, sir?"):
+            print("WAKE ACK ERROR: acknowledgement playback failed; "
+                  "continuing to listen", flush=True)
+        discard = getattr(mic, "discard_pending", None)
+        if callable(discard):
+            discard()
+        self._handle_request(mic)
+
     def _handle_request(self, mic):
         request_started = time.monotonic()
-        self._set_state("WAKE_DETECTED")
         print("MIC DEVICE: {}".format(config.MIC_DEVICE or "ALSA default"), flush=True)
         self._set_state("LISTENING")
         print("LISTENING...", flush=True)
@@ -458,7 +480,7 @@ class VoiceAssistant(threading.Thread):
     def _say_and_wait(self, text, response_started_at=None):
         self._set_state("SPEAKING")
         if self.speech is None or not self.speech.say(text):
-            print("AUDIO ERROR: speech unavailable", flush=True); return
+            print("AUDIO ERROR: speech unavailable", flush=True); return False
         deadline = time.monotonic() + config.SPEECH_MAX_HOLD_S + 3
         began = False
         while time.monotonic() < deadline and not self._stop_event.is_set():
@@ -472,8 +494,9 @@ class VoiceAssistant(threading.Thread):
                             self, "_end_of_speech_at", response_started_at)),
                         flush=True)
             if began and not active:
-                print("SPEECH COMPLETE", flush=True); return
+                print("SPEECH COMPLETE", flush=True); return True
             time.sleep(0.05)
+        return False
 
     def stop(self, timeout=3.0):
         self._stop_event.set()

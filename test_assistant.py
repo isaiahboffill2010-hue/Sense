@@ -18,6 +18,33 @@ class FakeMic:
     def read(self): return next(self.chunks)
 
 
+class WakeAckSpeech:
+    def __init__(self):
+        self.messages = []
+        self._reads = 0
+        self.ack_finished = False
+
+    def say(self, text):
+        self.messages.append(text)
+        self._reads = 0
+        return True
+
+    @property
+    def speaking(self):
+        if self.messages[-1] != "Yes, sir?":
+            return False
+        self._reads += 1
+        if self._reads >= 2:
+            self.ack_finished = True
+            return False
+        return True
+
+
+class WakeAckMic:
+    def __init__(self, events): self.events = events
+    def discard_pending(self): self.events.append("discard")
+
+
 class FakeCameraReader:
     def __init__(self, frame=None): self.frame = frame; self.calls = 0
     def fresh_frame(self): self.calls += 1; return self.frame
@@ -37,6 +64,30 @@ class AssistantTests(unittest.TestCase):
         self.voice._say_and_wait("Paris")
         self.assertEqual(self.voice.state, "SPEAKING")
         self.assertEqual(self.voice.speech.messages, ["Paris"])
+
+    def test_wake_ack_finishes_before_request_listening(self):
+        speech = WakeAckSpeech()
+        events = []
+        voice = assistant.VoiceAssistant(speech)
+        voice._handle_request = mock.Mock(
+            side_effect=lambda mic: events.append(
+                ("record", speech.ack_finished)))
+
+        voice._handle_wake_detected(WakeAckMic(events))
+
+        self.assertEqual(speech.messages, ["Yes, sir?"])
+        self.assertEqual(events, ["discard", ("record", True)])
+        voice._handle_request.assert_called_once()
+
+    def test_wake_ack_failure_still_enters_request_listening(self):
+        speech = mock.Mock()
+        speech.say.return_value = False
+        voice = assistant.VoiceAssistant(speech)
+        voice._handle_request = mock.Mock()
+
+        voice._handle_wake_detected(WakeAckMic([]))
+
+        voice._handle_request.assert_called_once()
 
     def test_microphone_failure_is_named(self):
         with mock.patch("assistant.shutil.which", return_value=None):
