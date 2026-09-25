@@ -362,8 +362,34 @@ def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None,
         # Repeated beeps: only DANGER sets a non-None interval. Spacing them
         # out while a phrase plays keeps both intelligible; the interval can
         # never become None here, so the warning can never be switched off.
-        beeper.set_interval(beep_interval_with_speech(
-            decision.repeat_interval, speech))
+        interval = beep_interval_with_speech(decision.repeat_interval, speech)
+        if hasattr(beeper, "set_speech_active"):
+            try:
+                beeper.set_speech_active(bool(
+                    getattr(speech, "speaking", False)))
+            except Exception:
+                beeper.set_speech_active(False)
+        previous_interval = getattr(beeper, "_last_alert_interval", object())
+        if interval != previous_interval:
+            print("ALERT APPLY: level={} distance={} interval={}".format(
+                decision.status,
+                "unknown" if distance is None else "{:.0f}".format(distance),
+                "none" if interval is None else "{:.2f}".format(interval)),
+                  flush=True)
+            print("BEEPER COMMAND: {} interval={}".format(
+                "enable" if interval is not None else "disable",
+                "none" if interval is None else "{:.2f}".format(interval)),
+                  flush=True)
+            beeper._last_alert_interval = interval
+        beeper.set_interval(interval)
+        if interval != previous_interval:
+            state = getattr(beeper, "snapshot", lambda: {})()
+            enabled = state.get("requested_interval", interval) is not None
+            actual_interval = state.get("requested_interval", interval)
+            print("BEEPER STATE AFTER COMMAND: enabled={} interval={}".format(
+                str(enabled).lower(),
+                "none" if actual_interval is None else
+                "{:.2f}".format(actual_interval)), flush=True)
         # One subtle tone, exactly on entering the WARNING band.
         if decision.play_warning_tone:
             beeper.play_once(TONE_WARNING)

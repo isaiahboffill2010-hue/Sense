@@ -348,6 +348,7 @@ class _AplayBackend:
                 name="persistent-warning-audio", daemon=True)
             self._repeat_thread.start()
             print("BEEPER ENABLED: yes (persistent ALSA stream)", flush=True)
+            return True
 
     def _repeat_loop(self, process, stop, interval):
         try:
@@ -557,11 +558,28 @@ class BeepController(threading.Thread):
         self._beep_count = 0
         self._persistent_interval = None
         self._persistent_supported = None
+        self._speech_active_override = None
+        self._last_suppression_log_at = 0.0
 
     def set_interval(self, interval):
         """Set seconds between repeated danger beeps, or None for silence."""
         with self._lock:
             self._interval = interval
+
+    def snapshot(self):
+        """Return command and persistent-stream state for runtime diagnostics."""
+        with self._lock:
+            return {
+                "requested_interval": self._interval,
+                "persistent_interval": self._persistent_interval,
+                "persistent_supported": self._persistent_supported,
+                "speech_active": self._speech_active_override,
+            }
+
+    def set_speech_active(self, active):
+        """Publish the controller's live speech state to the beeper worker."""
+        with self._lock:
+            self._speech_active_override = bool(active)
 
     def play_once(self, tone):
         """Queue a single tone. Returns immediately; the thread plays it."""
@@ -596,7 +614,16 @@ class BeepController(threading.Thread):
                 starter = getattr(self._player, "start_repeating", None)
                 self._persistent_supported = callable(starter)
             if self._persistent_supported:
-                if config.BEEP_PAUSE_WHILE_SPEAKING and speech_is_active():
+                with self._lock:
+                    speech_override = self._speech_active_override
+                speech_active = (speech_is_active() if speech_override is None
+                                 else speech_override)
+                if config.BEEP_PAUSE_WHILE_SPEAKING and speech_active:
+                    now = time.monotonic()
+                    if now - self._last_suppression_log_at >= 1.0:
+                        self._last_suppression_log_at = now
+                        print("BEEPER SUPPRESSED: reason=speech active",
+                              flush=True)
                     self._stop_persistent()
                     self._stop_event.wait(self.IDLE_POLL_S)
                     continue
@@ -663,6 +690,7 @@ class BeepController(threading.Thread):
                 self._beep_count += 1
 
     def stop(self, timeout=2.0):
+        print("BEEPER STOP: caller/reason=shutdown", flush=True)
         self.set_interval(None)
         self._stop_persistent()
         with self._lock:

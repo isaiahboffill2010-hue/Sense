@@ -198,10 +198,17 @@ class AlertPolicy:
             self._last_ai_request_at = self._now()
             self._last_ai_distance_cm = distance_cm
 
+        repeat_interval = beep_interval_for(
+            filtered_distance, self._closing_rate_cm_s)
+        # The HUD status is based on the raw reading so a close obstacle is
+        # never hidden by the approach filter. Keep the audio decision
+        # consistent with that safety-critical status as well.
+        if status == DANGER:
+            repeat_interval = config.BEEP_INTERVAL_DANGER_S
+
         return AlertDecision(
             status=status,
-            repeat_interval=beep_interval_for(
-                filtered_distance, self._closing_rate_cm_s),
+            repeat_interval=repeat_interval,
             play_warning_tone=play_tone,
             request_ai=bool(ai_reason),
             ai_reason=ai_reason,

@@ -1635,6 +1635,17 @@ def _danger_snapshot(distance=18.0):
             "healthy": True, "reading_count": 9}
 
 
+# This is the original field failure: a sudden close reading is displayed as
+# DANGER, but the filtered value used to leave the main-loop beeper silent.
+policy = alerts.AlertPolicy(now=FakeClock())
+beeps = _Beeps()
+app.apply_alert_policy(policy, _danger_snapshot(100.0), beeps)
+status = app.apply_alert_policy(policy, _danger_snapshot(20.0), beeps)
+check("main runtime reports sudden DANGER", status, alerts.DANGER)
+check("main runtime commands a DANGER beep",
+      beeps.intervals[-1], config.BEEP_INTERVAL_DANGER_S)
+
+
 # --- an accepted result while in DANGER must be spoken -------------------
 policy = alerts.AlertPolicy()
 beeps = _Beeps()
