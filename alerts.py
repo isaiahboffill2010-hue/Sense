@@ -87,13 +87,15 @@ def beep_interval_for(distance_cm, closing_rate_cm_s=None):
                     (config.PROXIMITY_TRACK_DISTANCE_CM -
                      config.PROXIMITY_SLOW_DISTANCE_CM))
         return config.PROXIMITY_SLOW_INTERVAL_S - fraction * (
-            config.PROXIMITY_SLOW_INTERVAL_S - config.PROXIMITY_FAST_INTERVAL_S)
+            config.PROXIMITY_SLOW_INTERVAL_S -
+            config.PROXIMITY_MEDIUM_INTERVAL_S)
     if distance_cm >= config.PROXIMITY_FAST_DISTANCE_CM:
         fraction = ((config.PROXIMITY_SLOW_DISTANCE_CM - distance_cm) /
                     (config.PROXIMITY_SLOW_DISTANCE_CM -
                      config.PROXIMITY_FAST_DISTANCE_CM))
-        return config.PROXIMITY_FAST_INTERVAL_S - fraction * (
-            config.PROXIMITY_FAST_INTERVAL_S - config.PROXIMITY_DANGER_INTERVAL_S)
+        return config.PROXIMITY_MEDIUM_INTERVAL_S - fraction * (
+            config.PROXIMITY_MEDIUM_INTERVAL_S -
+            config.PROXIMITY_FAST_INTERVAL_S)
     return config.PROXIMITY_DANGER_INTERVAL_S
 
 
@@ -177,7 +179,7 @@ class AlertPolicy:
     def update(self, distance_cm):
         raw_distance = distance_cm
         filtered_distance = self._filter_distance(distance_cm)
-        self._log_proximity(filtered_distance)
+        self._log_proximity(raw_distance, filtered_distance)
         previous = self._status
         status = classify_with_hysteresis(raw_distance, previous)
         self._status = status
@@ -240,7 +242,7 @@ class AlertPolicy:
                     0.0, (first_distance - last_distance) / elapsed)
         return self._filtered_distance_cm
 
-    def _log_proximity(self, distance_cm):
+    def _log_proximity(self, raw_distance, distance_cm):
         level = proximity_level(distance_cm, self._closing_rate_cm_s)
         now = self._now()
         if (level == self._last_log_level and self._last_log_at is not None and
@@ -249,14 +251,17 @@ class AlertPolicy:
         self._last_log_at = now
         self._last_log_level = level
         if distance_cm is None:
-            print("DISTANCE: unavailable | PROXIMITY LEVEL: UNKNOWN", flush=True)
+            print("RAW DISTANCE: {} | FILTERED DISTANCE: unavailable | "
+                  "PROXIMITY LEVEL: UNKNOWN".format(raw_distance), flush=True)
             return
         rate = ("n/a" if self._closing_rate_cm_s is None else
                 "{:.0f} cm/s".format(self._closing_rate_cm_s))
         interval = beep_interval_for(distance_cm, self._closing_rate_cm_s)
-        print("DISTANCE: {:.0f} cm | CLOSING RATE: {} | PROXIMITY LEVEL: {} | "
-              "BEEP INTERVAL: {}".format(
-                  distance_cm, rate, level,
+        print("RAW DISTANCE: {} cm | FILTERED DISTANCE: {:.0f} cm | "
+              "CLOSING RATE: {} | PROXIMITY LEVEL: {} | "
+              "REQUESTED BEEP INTERVAL: {}".format(
+                  "{:.0f}".format(raw_distance) if raw_distance is not None
+                  else "unavailable", distance_cm, rate, level,
                   "silent" if interval is None else "{:.2f}s".format(interval)),
               flush=True)
 

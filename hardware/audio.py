@@ -256,6 +256,13 @@ class _AplayBackend:
         self._wav_paths = {tone: str(path) for tone, path in wav_paths.items()}
         self._processes = []
         self._skipped_for_speech = 0
+        self._repeat_process = None
+        self._repeat_thread = None
+        self._repeat_stop = None
+        self._repeat_lock = threading.Lock()
+        self._repeat_wav_path = wav_paths[TONE_DANGER]
+        self._repeat_pcm = None
+        self._repeat_last_log_at = 0.0
 
         # "-D <device>" pins playback to one ALSA device, so a Robot HAT I2S
         # speaker that has become the system default cannot steal the beeps.
@@ -310,6 +317,91 @@ class _AplayBackend:
                 )
             )
 
+    @staticmethod
+    def _read_pcm(path):
+        import wave
+        with wave.open(str(path), "rb") as wav:
+            return wav.readframes(wav.getnframes())
+
+    def start_repeating(self, interval):
+        """Run repeated warnings through one persistent ALSA raw stream."""
+        with self._repeat_lock:
+            if self._repeat_thread is not None:
+                return
+            if self._repeat_pcm is None:
+                self._repeat_pcm = self._read_pcm(self._repeat_wav_path)
+            try:
+                process = subprocess.Popen(
+                    ["aplay", "-q"] + self._device_args + [
+                        "-t", "raw", "-f", "S16_LE", "-r",
+                        str(config.BEEP_SAMPLE_RATE), "-c", "2"],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            except Exception as exc:
+                raise AudioError("persistent warning stream failed: {}".format(exc))
+            stop = threading.Event()
+            self._repeat_process = process
+            self._repeat_stop = stop
+            self._repeat_thread = threading.Thread(
+                target=self._repeat_loop, args=(process, stop, float(interval)),
+                name="persistent-warning-audio", daemon=True)
+            self._repeat_thread.start()
+            print("BEEPER ENABLED: yes (persistent ALSA stream)", flush=True)
+
+    def _repeat_loop(self, process, stop, interval):
+        try:
+            gap = max(0.0, interval - config.BEEP_DURATION_S)
+            while not stop.is_set():
+                if process.stdin is None:
+                    raise RuntimeError("warning stream stdin is closed")
+                process.stdin.write(self._repeat_pcm)
+                process.stdin.flush()
+                now = time.monotonic()
+                if now - self._repeat_last_log_at >= 1.0:
+                    self._repeat_last_log_at = now
+                    print("ACTUAL BEEP FIRED", flush=True)
+                if stop.wait(gap):
+                    break
+        except Exception as exc:
+            if not stop.is_set():
+                detail = ""
+                try:
+                    if process.stderr is not None:
+                        detail = process.stderr.read().decode(
+                            "utf-8", "replace").strip()
+                except Exception:
+                    pass
+                print("BEEP FAILED: {}{}".format(
+                    exc, ": " + detail if detail else ""), flush=True)
+        finally:
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception:
+                pass
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+
+    def stop_repeating(self):
+        with self._repeat_lock:
+            thread, stop, process = (
+                self._repeat_thread, self._repeat_stop, self._repeat_process)
+            self._repeat_thread = self._repeat_stop = self._repeat_process = None
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+
     def play(self, tone=TONE_DANGER):
         # Stand aside while a phrase is being spoken. Starting aplay now
         # would take the exclusive device away from the voice, and one of
@@ -336,6 +428,7 @@ class _AplayBackend:
             ) from exc
 
     def close(self):
+        self.stop_repeating()
         for process in self._processes:
             try:
                 if process.poll() is None:
@@ -414,7 +507,20 @@ class BeepPlayer:
             raise AudioError("Audio is not open. Call open() first.")
         self._backend.play(tone)
 
+    def start_repeating(self, interval):
+        starter = getattr(self._backend, "start_repeating", None)
+        if not callable(starter):
+            return False
+        starter(interval)
+        return True
+
+    def stop_repeating(self):
+        stopper = getattr(self._backend, "stop_repeating", None)
+        if callable(stopper):
+            stopper()
+
     def close(self):
+        self.stop_repeating()
         if self._backend is not None:
             self._backend.close()
             self._backend = None
@@ -449,6 +555,8 @@ class BeepController(threading.Thread):
         self._pending = []           # one-shot tones waiting to be played
         self._error = None
         self._beep_count = 0
+        self._persistent_interval = None
+        self._persistent_supported = None
 
     def set_interval(self, interval):
         """Set seconds between repeated danger beeps, or None for silence."""
@@ -484,6 +592,30 @@ class BeepController(threading.Thread):
             with self._lock:
                 interval = self._interval
 
+            if self._persistent_supported is None:
+                starter = getattr(self._player, "start_repeating", None)
+                self._persistent_supported = callable(starter)
+            if self._persistent_supported:
+                if config.BEEP_PAUSE_WHILE_SPEAKING and speech_is_active():
+                    self._stop_persistent()
+                    self._stop_event.wait(self.IDLE_POLL_S)
+                    continue
+                if interval != self._persistent_interval:
+                    self._stop_persistent()
+                    if interval is not None:
+                        try:
+                            started = self._player.start_repeating(interval)
+                            if started:
+                                self._persistent_interval = interval
+                                self._log_enabled(True)
+                            else:
+                                self._persistent_supported = False
+                        except Exception as exc:
+                            self._log_failure(exc)
+                if self._persistent_supported:
+                    self._stop_event.wait(self.IDLE_POLL_S)
+                    continue
+
             if interval is None:
                 # Not repeating: poll often so we react quickly to new work.
                 self._stop_event.wait(self.IDLE_POLL_S)
@@ -495,6 +627,24 @@ class BeepController(threading.Thread):
             # Ctrl+C never have to wait out a beep interval.
             self._stop_event.wait(max(0.05, interval))
 
+    def _stop_persistent(self):
+        if self._persistent_interval is None:
+            return
+        try:
+            self._player.stop_repeating()
+        except Exception as exc:
+            self._log_failure(exc)
+        self._persistent_interval = None
+
+    @staticmethod
+    def _log_enabled(enabled):
+        print("BEEPER ENABLED: {}".format("yes" if enabled else "no"),
+              flush=True)
+
+    @staticmethod
+    def _log_failure(exc):
+        print("BEEP FAILED: {}".format(exc), flush=True)
+
     def _play(self, tone):
         """Play one tone, recording any failure instead of raising."""
         try:
@@ -502,9 +652,11 @@ class BeepController(threading.Thread):
         except AudioError as exc:
             with self._lock:
                 self._error = str(exc)
+            self._log_failure(exc)
         except Exception as exc:
             with self._lock:
                 self._error = "{}: {}".format(type(exc).__name__, exc)
+            self._log_failure(exc)
         else:
             with self._lock:
                 self._error = None
@@ -512,6 +664,7 @@ class BeepController(threading.Thread):
 
     def stop(self, timeout=2.0):
         self.set_interval(None)
+        self._stop_persistent()
         with self._lock:
             self._pending = []
         self._stop_event.set()
