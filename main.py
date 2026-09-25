@@ -375,6 +375,7 @@ def apply_alert_policy(policy, snapshot, beeper, frame=None, vision=None,
         vision.note_current_state(distance, decision.status)
 
         if decision.request_ai and frame is not None:
+            print("VISION TRIGGER: {}".format(decision.ai_reason), flush=True)
             vision.request(frame, distance, decision.status, decision.ai_reason)
 
     return decision.status
@@ -404,6 +405,11 @@ def beep_interval_with_speech(interval, speech):
         speaking = False
 
     if not speaking:
+        return interval
+
+    # Slow proximity beeps already leave room for speech. Do not apply the
+    # urgent-warning clamp to them, which would accidentally make them faster.
+    if interval >= config.BEEP_MAX_INTERVAL_WHILE_SPEAKING_S:
         return interval
 
     # Clamped so the beeps stay recognisably urgent no matter how the
@@ -436,6 +442,8 @@ def speak_new_guidance(vision, speech, spoken_generation):
     if not text:
         return spoken_generation
 
+    print("OBSTACLE IDENTIFIED: {}".format(text), flush=True)
+    print("SAFETY SPEECH: {}".format(text), flush=True)
     speech.say(text)
     # Mark it handled either way. say() logs its own reason when it declines
     # (danger, duplicate), and retrying the same generation every frame

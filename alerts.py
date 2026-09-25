@@ -53,17 +53,48 @@ def classify(distance_cm):
     return DANGER
 
 
-def beep_interval_for(status):
-    """Seconds between repeated beeps for a status, or None to stay silent.
+def proximity_level(distance_cm, closing_rate_cm_s=None):
+    if distance_cm is None:
+        return "UNKNOWN"
+    if (closing_rate_cm_s is not None and
+            closing_rate_cm_s >= config.APPROACH_WARNING_RATE_CM_S and
+            distance_cm <= config.APPROACH_WARNING_DISTANCE_CM):
+        return "APPROACH"
+    if distance_cm > config.PROXIMITY_TRACK_DISTANCE_CM:
+        return "TRACK"
+    if distance_cm >= config.PROXIMITY_SLOW_DISTANCE_CM:
+        return "SLOW"
+    if distance_cm >= config.PROXIMITY_FAST_DISTANCE_CM:
+        return "FAST"
+    return "DANGER"
 
-    Only DANGER repeats. CAUTION and WARNING are silent bands - WARNING gets
-    a single tone on entry instead, which AlertPolicy handles.
 
-    UNKNOWN is silent on purpose: a broken sensor must not fake an alarm.
-    """
-    if status == DANGER:
-        return config.BEEP_INTERVAL_DANGER_S
-    return None
+def beep_interval_for(distance_cm, closing_rate_cm_s=None):
+    """Return a continuous local beep interval, or None when tracking only."""
+    if isinstance(distance_cm, str):
+        return config.BEEP_INTERVAL_DANGER_S if distance_cm == DANGER else None
+    if distance_cm is None:
+        return None
+    if (closing_rate_cm_s is not None and
+            closing_rate_cm_s >= config.APPROACH_WARNING_RATE_CM_S and
+            distance_cm <= config.APPROACH_WARNING_DISTANCE_CM and
+            distance_cm > config.PROXIMITY_TRACK_DISTANCE_CM):
+        return config.PROXIMITY_SLOW_INTERVAL_S
+    if distance_cm > config.PROXIMITY_TRACK_DISTANCE_CM:
+        return None
+    if distance_cm >= config.PROXIMITY_SLOW_DISTANCE_CM:
+        fraction = ((config.PROXIMITY_TRACK_DISTANCE_CM - distance_cm) /
+                    (config.PROXIMITY_TRACK_DISTANCE_CM -
+                     config.PROXIMITY_SLOW_DISTANCE_CM))
+        return config.PROXIMITY_SLOW_INTERVAL_S - fraction * (
+            config.PROXIMITY_SLOW_INTERVAL_S - config.PROXIMITY_FAST_INTERVAL_S)
+    if distance_cm >= config.PROXIMITY_FAST_DISTANCE_CM:
+        fraction = ((config.PROXIMITY_SLOW_DISTANCE_CM - distance_cm) /
+                    (config.PROXIMITY_SLOW_DISTANCE_CM -
+                     config.PROXIMITY_FAST_DISTANCE_CM))
+        return config.PROXIMITY_FAST_INTERVAL_S - fraction * (
+            config.PROXIMITY_FAST_INTERVAL_S - config.PROXIMITY_DANGER_INTERVAL_S)
+    return config.PROXIMITY_DANGER_INTERVAL_S
 
 
 def color_for(status):
@@ -81,7 +112,8 @@ SEVERITY = {UNKNOWN: -1, SAFE: 0, CAUTION: 1, WARNING: 2, DANGER: 3}
 # What AlertPolicy.update() hands back to the main loop.
 AlertDecision = collections.namedtuple(
     "AlertDecision",
-    ["status", "repeat_interval", "play_warning_tone", "request_ai", "ai_reason"],
+    ["status", "repeat_interval", "play_warning_tone", "request_ai",
+     "ai_reason", "proximity_level", "closing_rate_cm_s"],
 )
 
 
@@ -130,6 +162,11 @@ class AlertPolicy:
         self._last_warning_tone_at = None
         self._last_ai_request_at = None
         self._last_ai_distance_cm = None
+        self._samples = collections.deque()
+        self._filtered_distance_cm = None
+        self._closing_rate_cm_s = None
+        self._last_log_at = None
+        self._last_log_level = None
         # Injectable clock so tests do not have to sleep in real time.
         self._now = now or time.monotonic
 
@@ -138,8 +175,11 @@ class AlertPolicy:
         return self._status
 
     def update(self, distance_cm):
+        raw_distance = distance_cm
+        filtered_distance = self._filter_distance(distance_cm)
+        self._log_proximity(filtered_distance)
         previous = self._status
-        status = classify_with_hysteresis(distance_cm, previous)
+        status = classify_with_hysteresis(raw_distance, previous)
         self._status = status
 
         # The tone fires on the TRANSITION into WARNING, not while sitting
@@ -151,18 +191,74 @@ class AlertPolicy:
         if play_tone:
             self._last_warning_tone_at = self._now()
 
-        ai_reason = self._ai_reason(status, previous, distance_cm)
+        ai_reason = self._ai_reason(status, previous, raw_distance)
         if ai_reason:
             self._last_ai_request_at = self._now()
             self._last_ai_distance_cm = distance_cm
 
         return AlertDecision(
             status=status,
-            repeat_interval=beep_interval_for(status),
+            repeat_interval=beep_interval_for(
+                filtered_distance, self._closing_rate_cm_s),
             play_warning_tone=play_tone,
             request_ai=bool(ai_reason),
             ai_reason=ai_reason,
+            proximity_level=proximity_level(
+                filtered_distance, self._closing_rate_cm_s),
+            closing_rate_cm_s=self._closing_rate_cm_s,
         )
+
+    @property
+    def closing_rate_cm_s(self):
+        return self._closing_rate_cm_s
+
+    def _filter_distance(self, distance_cm):
+        now = self._now()
+        if distance_cm is None:
+            self._closing_rate_cm_s = None
+            return None
+        if (self._filtered_distance_cm is not None and
+                abs(distance_cm - self._filtered_distance_cm) >
+                config.APPROACH_OUTLIER_CM):
+            return self._filtered_distance_cm
+        self._samples.append((now, float(distance_cm)))
+        cutoff = now - config.APPROACH_HISTORY_S
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        self._filtered_distance_cm = float(distance_cm)
+        self._closing_rate_cm_s = None
+        if len(self._samples) >= config.APPROACH_MIN_SAMPLES:
+            first_time, first_distance = self._samples[0]
+            last_time, last_distance = self._samples[-1]
+            elapsed = last_time - first_time
+            samples = list(self._samples)
+            decreases = sum(
+                left > right + 1.0
+                for (_, left), (_, right) in zip(samples, samples[1:]))
+            if elapsed > 0 and decreases >= config.APPROACH_MIN_SAMPLES - 1:
+                self._closing_rate_cm_s = max(
+                    0.0, (first_distance - last_distance) / elapsed)
+        return self._filtered_distance_cm
+
+    def _log_proximity(self, distance_cm):
+        level = proximity_level(distance_cm, self._closing_rate_cm_s)
+        now = self._now()
+        if (level == self._last_log_level and self._last_log_at is not None and
+                now - self._last_log_at < config.ALERT_LOG_INTERVAL_S):
+            return
+        self._last_log_at = now
+        self._last_log_level = level
+        if distance_cm is None:
+            print("DISTANCE: unavailable | PROXIMITY LEVEL: UNKNOWN", flush=True)
+            return
+        rate = ("n/a" if self._closing_rate_cm_s is None else
+                "{:.0f} cm/s".format(self._closing_rate_cm_s))
+        interval = beep_interval_for(distance_cm, self._closing_rate_cm_s)
+        print("DISTANCE: {:.0f} cm | CLOSING RATE: {} | PROXIMITY LEVEL: {} | "
+              "BEEP INTERVAL: {}".format(
+                  distance_cm, rate, level,
+                  "silent" if interval is None else "{:.2f}s".format(interval)),
+              flush=True)
 
     def _warning_tone_is_armed(self):
         """False if the tone sounded too recently to play again.
@@ -206,10 +302,17 @@ class AlertPolicy:
         Moving AWAY never asks on its own: backing out of DANGER into
         WARNING is a decrease in severity.
         """
-        if status not in (CAUTION, WARNING, DANGER):
+        approaching = (self._closing_rate_cm_s is not None and
+                       self._closing_rate_cm_s >= config.APPROACH_WARNING_RATE_CM_S)
+        if status not in (CAUTION, WARNING, DANGER) and not (
+                approaching and distance_cm is not None and
+                distance_cm <= config.APPROACH_WARNING_DISTANCE_CM):
             return None
         if not self._ai_is_armed():
             return None
+
+        if approaching and distance_cm <= config.APPROACH_WARNING_DISTANCE_CM:
+            return "approaching obstacle"
 
         if SEVERITY[status] > SEVERITY[previous]:
             return "band"

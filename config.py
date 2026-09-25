@@ -128,6 +128,21 @@ WARNING_DISTANCE_CM = 25.0    # at/above this (and < CAUTION) -> WARNING
 # This is now the only band that repeats.
 BEEP_INTERVAL_DANGER_S = 0.15
 
+# Progressive proximity audio. Existing status bands remain useful for the
+# HUD and Gemini relevance checks; these values control local safety beeps.
+PROXIMITY_TRACK_DISTANCE_CM = 100.0
+PROXIMITY_SLOW_DISTANCE_CM = 60.0
+PROXIMITY_FAST_DISTANCE_CM = 35.0
+PROXIMITY_SLOW_INTERVAL_S = 1.20
+PROXIMITY_FAST_INTERVAL_S = 0.35
+PROXIMITY_DANGER_INTERVAL_S = BEEP_INTERVAL_DANGER_S
+APPROACH_WARNING_DISTANCE_CM = 180.0
+APPROACH_WARNING_RATE_CM_S = 35.0
+APPROACH_MIN_SAMPLES = 3
+APPROACH_HISTORY_S = 1.2
+APPROACH_OUTLIER_CM = 45.0
+ALERT_LOG_INTERVAL_S = 1.0
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # ANTI-CHATTER
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

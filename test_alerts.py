@@ -109,13 +109,48 @@ check("49,25 -> WARNING", statuses[5:7], ["WARNING", "WARNING"])
 check("24,1 -> DANGER", statuses[7:], ["DANGER", "DANGER"])
 
 # ==========================================================================
-print("\nOnly DANGER repeats; CAUTION and WARNING are silent bands")
+print("\nProgressive proximity intervals")
 # ==========================================================================
-_, _, repeats = run([150, 75, 40, 10])
-check("SAFE repeat interval", repeats[0], None)
-check("CAUTION repeat interval", repeats[1], None)
-check("WARNING repeat interval", repeats[2], None)
-check("DANGER repeat interval", repeats[3], config.BEEP_INTERVAL_DANGER_S)
+check("SAFE repeat interval", alerts.beep_interval_for(150), None)
+check("75 cm is slower than 40 cm",
+      alerts.beep_interval_for(75) > alerts.beep_interval_for(40), True)
+check("40 cm is faster than 75 cm",
+      alerts.beep_interval_for(40) < alerts.beep_interval_for(75), True)
+check("20 cm reaches danger cadence", alerts.beep_interval_for(20),
+      config.BEEP_INTERVAL_DANGER_S)
+
+check("90 cm has a slow interval", alerts.beep_interval_for(90) > 0, True)
+check("60 cm is faster than 90 cm",
+      alerts.beep_interval_for(60) < alerts.beep_interval_for(90), True)
+check("40 cm is faster than 60 cm",
+      alerts.beep_interval_for(40) < alerts.beep_interval_for(60), True)
+check("20 cm is rapid", alerts.beep_interval_for(20),
+      config.BEEP_INTERVAL_DANGER_S)
+
+print("\nApproach-rate filtering and earlier warning")
+clock = FakeClock()
+approach_policy = alerts.AlertPolicy(now=clock)
+approach_decisions = [approach_policy.update(
+      clock.advance(0.25) or distance) for distance in (180, 145, 110, 75)]
+approach_decision = approach_decisions[-1]
+approach_ai_reason = next((d.ai_reason for d in approach_decisions
+                                       if d.ai_reason), None)
+check("rapid approach has a closing rate",
+      approach_decision.closing_rate_cm_s >= config.APPROACH_WARNING_RATE_CM_S, True)
+check("rapid approach has an early beep",
+      approach_decision.repeat_interval is not None, True)
+check("rapid approach requests vision early",
+      approach_ai_reason, "approaching obstacle")
+
+noise_clock = FakeClock()
+noise_policy = alerts.AlertPolicy(now=noise_clock)
+noise_policy.update(180)
+noise_clock.advance(0.25)
+noise_policy.update(145)
+noise_clock.advance(0.25)
+noise_policy.update(400)
+check("single outlier does not become a close warning",
+      noise_policy.update(145).proximity_level in ("APPROACH", "TRACK"), True)
 
 # ==========================================================================
 print("\nA person walking in, then standing still at 30-40 cm")
