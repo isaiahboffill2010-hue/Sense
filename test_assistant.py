@@ -36,6 +36,20 @@ class AssistantTests(unittest.TestCase):
         with mock.patch.object(assistant.config, "ASSISTANT_SPEECH_START_TIMEOUT_S", 0):
             self.assertEqual(self.voice._record_utterance(FakeMic([quiet])), b"")
 
+    def test_rejects_obvious_timestamp_noise_from_stt(self):
+        self.assertEqual(self.voice._clean_transcript("00:00"), "")
+        self.assertEqual(self.voice._clean_transcript("What is the capital of France?"),
+                         "What is the capital of France?")
+
+    def test_post_wake_capture_keeps_a_pre_roll_buffer(self):
+        with mock.patch.object(assistant.config, "ASSISTANT_PRE_SPEECH_BUFFER_S", 0.2):
+            with mock.patch.object(assistant.config, "ASSISTANT_SILENCE_TIMEOUT_S", 0.2):
+                with mock.patch.object(assistant.config, "ASSISTANT_ENERGY_THRESHOLD", 10):
+                    packets = [b"\x00\x00" * 160, b"\x20\x00" * 160,
+                               b"\x20\x00" * 160, b"\x00\x00" * 160]
+                    data = self.voice._record_utterance(FakeMic(packets))
+                    self.assertGreater(len(data), 0)
+
     def _run_failure(self, answer_error=False):
         self.voice._record_utterance = mock.Mock(return_value=b"audio")
         self.voice._transcribe = mock.Mock(return_value="hello" if answer_error else "")

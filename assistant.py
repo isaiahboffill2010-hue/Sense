@@ -6,7 +6,9 @@ inside this worker so the safety threads remain independent.
 """
 import audioop
 import collections
+import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -83,14 +85,14 @@ class MicrophoneStream:
                     pass
 
 
-def pcm_to_wav(pcm):
-    handle = tempfile.NamedTemporaryFile(prefix="sense-question-", suffix=".wav",
-                                         delete=False)
-    path = handle.name
-    handle.close()
+def pcm_to_wav(pcm, path=None):
+    path = path or "/tmp/sense-last-request.wav"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with wave.open(path, "wb") as wav:
-        wav.setnchannels(1); wav.setsampwidth(2)
-        wav.setframerate(config.ASSISTANT_SAMPLE_RATE); wav.writeframes(pcm)
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(config.ASSISTANT_SAMPLE_RATE)
+        wav.writeframes(pcm)
     return path
 
 
@@ -182,6 +184,7 @@ class VoiceAssistant(threading.Thread):
 
     def _handle_request(self, mic):
         self._set_state("WAKE_DETECTED")
+        print("MIC DEVICE: {}".format(config.MIC_DEVICE or "ALSA default"), flush=True)
         if self.beeper is not None:
             self.beeper.play_once(config.ASSISTANT_ACK_TONE)
             time.sleep(config.BEEP_DURATION_S + 0.08)
@@ -191,13 +194,13 @@ class VoiceAssistant(threading.Thread):
         if not pcm:
             self._say_and_wait("I didn't catch that.")
             return
-        path = pcm_to_wav(pcm)
+        path = pcm_to_wav(pcm, "/tmp/sense-last-request.wav")
         try:
             self._set_state("TRANSCRIBING")
             text = self._transcribe(path)
         finally:
-            try: os.unlink(path)
-            except OSError: pass
+            pass
+        text = self._clean_transcript(text)
         if not text:
             print("STT ERROR: no usable speech", flush=True)
             self._say_and_wait("I didn't catch that.")
@@ -216,38 +219,96 @@ class VoiceAssistant(threading.Thread):
         self._say_and_wait(answer)
 
     def _record_utterance(self, mic):
-        chunks, speaking, silence = [], False, 0.0
-        started = time.monotonic()
         chunk_s = config.ASSISTANT_CHUNK_MS / 1000.0
+        pre_buffer_s = max(0.2, float(config.ASSISTANT_PRE_SPEECH_BUFFER_S))
+        pre_buffer_max = max(1, int(pre_buffer_s / chunk_s))
+        pre_buffer = collections.deque(maxlen=pre_buffer_max)
+        chunks = bytearray()
+        speech_started = False
+        speech_start_at = None
+        silence = 0.0
+        started = time.monotonic()
+        last_rms = 0.0
+
         while not self._stop_event.is_set():
-            data = mic.read(); elapsed = time.monotonic() - started
-            loud = audioop.rms(data, 2) >= config.ASSISTANT_ENERGY_THRESHOLD
-            if loud:
-                if not speaking:
-                    speaking = True; print("SPEECH: detected", flush=True)
-                chunks.append(data); silence = 0.0
-            elif speaking:
-                chunks.append(data); silence += chunk_s
-                if silence >= config.ASSISTANT_SILENCE_TIMEOUT_S:
-                    print("SPEECH: ended", flush=True); break
-            if not speaking and elapsed >= config.ASSISTANT_SPEECH_START_TIMEOUT_S:
+            try:
+                data = mic.read()
+            except (StopIteration, OSError, EOFError):
+                print("MIC ERROR: microphone stream ended unexpectedly", flush=True)
                 break
+            elapsed = time.monotonic() - started
+            rms = audioop.rms(data, 2) if data else 0
+            last_rms = max(last_rms, rms)
+            if not speech_started:
+                pre_buffer.append(data)
+                if rms >= config.ASSISTANT_ENERGY_THRESHOLD:
+                    speech_started = True
+                    speech_start_at = time.monotonic()
+                    print("RECORDING START", flush=True)
+                    print("SPEECH START: {:.2f}s".format(elapsed), flush=True)
+                    chunks.extend(b"".join(pre_buffer))
+                    pre_buffer.clear()
+                    chunks.extend(data)
+                    silence = 0.0
+                    continue
+                if elapsed >= config.ASSISTANT_SPEECH_START_TIMEOUT_S:
+                    print("SPEECH: no speech detected before timeout", flush=True)
+                    break
+            else:
+                chunks.extend(data)
+                if rms >= config.ASSISTANT_ENERGY_THRESHOLD:
+                    silence = 0.0
+                else:
+                    silence += chunk_s
+                    if silence >= config.ASSISTANT_SILENCE_TIMEOUT_S:
+                        print("SPEECH END: {:.2f}s".format(elapsed), flush=True)
+                        break
             if elapsed >= config.ASSISTANT_MAX_RECORDING_S:
                 print("SPEECH: maximum recording duration reached", flush=True)
                 break
+
+        if speech_started:
+            duration = time.monotonic() - started
+            print("RECORDED DURATION: {:.2f}s".format(duration), flush=True)
+            print("WAV SIZE: {} bytes".format(len(chunks)), flush=True)
+            print("AUDIO RMS: {}".format(last_rms), flush=True)
+            print("RECORDING COMPLETE", flush=True)
+            return bytes(chunks)
         print("RECORDING COMPLETE", flush=True)
-        return b"".join(chunks) if speaking else b""
+        return b""
+
+    @staticmethod
+    def _clean_transcript(text):
+        cleaned = " ".join(str(text or "").replace("\n", " ").split())
+        if not cleaned:
+            return ""
+        cleaned = cleaned.strip()
+        lowered = cleaned.lower()
+        if lowered in {"00:00", "0:00", "00:00:00", "0:00:00", "her", "hr"}:
+            return ""
+        if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", cleaned):
+            return ""
+        if re.fullmatch(r"[\d: .]+", cleaned) and not any(ch.isalpha() for ch in cleaned):
+            return ""
+        if len(cleaned) < 3 and not any(ch.isalpha() for ch in cleaned):
+            return ""
+        return cleaned
 
     def _transcribe(self, path):
         from google.genai import types
         with open(path, "rb") as source:
             audio = source.read()
+        print("STT SENDING: audio/wav", flush=True)
+        print("WAV SIZE: {} bytes".format(len(audio)), flush=True)
         response = self._gemini._client.models.generate_content(
             model=config.ASSISTANT_GEMINI_MODEL,
-            contents=[types.Part.from_bytes(data=audio, mime_type="audio/wav"),
-                      "Transcribe this speech exactly. Return only the words spoken."],
+            contents=[
+                types.Part.from_bytes(data=audio, mime_type="audio/wav"),
+                config.ASSISTANT_STT_PROMPT,
+            ],
         )
-        return " ".join((getattr(response, "text", "") or "").split()).strip()
+        text = " ".join((getattr(response, "text", "") or "").split()).strip()
+        return self._clean_transcript(text)
 
     def _answer(self, text):
         from google.genai import types

@@ -625,14 +625,18 @@ ASSISTANT_WAKE_PHRASE = os.environ.get("ASSISTANT_WAKE_PHRASE", "hey sense")
 MIC_DEVICE = os.environ.get("MIC_DEVICE", "").strip() or None
 ASSISTANT_SAMPLE_RATE = 16000
 ASSISTANT_CHUNK_MS = 100
+ASSISTANT_PRE_SPEECH_BUFFER_S = float(os.environ.get(
+    "ASSISTANT_PRE_SPEECH_BUFFER_S", "0.55"))
 ASSISTANT_SILENCE_TIMEOUT_S = float(os.environ.get(
-    "ASSISTANT_SILENCE_TIMEOUT_S", "1.3"))
+    "ASSISTANT_SILENCE_TIMEOUT_S", "1.6"))
 ASSISTANT_SPEECH_START_TIMEOUT_S = float(os.environ.get(
-    "ASSISTANT_SPEECH_START_TIMEOUT_S", "6.0"))
+    "ASSISTANT_SPEECH_START_TIMEOUT_S", "8.0"))
 ASSISTANT_MAX_RECORDING_S = float(os.environ.get(
-    "ASSISTANT_MAX_RECORDING_S", "15.0"))
+    "ASSISTANT_MAX_RECORDING_S", "18.0"))
+ASSISTANT_MIN_SPEECH_SECONDS = float(os.environ.get(
+    "ASSISTANT_MIN_SPEECH_SECONDS", "0.35"))
 ASSISTANT_ENERGY_THRESHOLD = int(os.environ.get(
-    "ASSISTANT_ENERGY_THRESHOLD", "500"))
+    "ASSISTANT_ENERGY_THRESHOLD", "180"))
 ASSISTANT_WAKE_THRESHOLD = float(os.environ.get(
     "ASSISTANT_WAKE_THRESHOLD", "1e-18"))
 ASSISTANT_GEMINI_MODEL = os.environ.get(
@@ -643,5 +647,10 @@ ASSISTANT_SYSTEM_PROMPT = (
     "You are Sense, a concise voice assistant inside an assistive wearable. "
     "Respond naturally for spoken audio. Keep ordinary answers brief unless "
     "the user asks for more detail. Do not use markdown."
+)
+ASSISTANT_STT_PROMPT = (
+    "Transcribe the user's spoken request accurately. Return only the words "
+    "spoken by the user. Do not answer the request, describe the audio, add "
+    "timestamps, or add commentary."
 )
 ASSISTANT_ACK_TONE = "warning"
