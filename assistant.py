@@ -163,6 +163,14 @@ class VoiceAssistant(threading.Thread):
         return self
 
     def run(self):
+        # "Sense ready." is queued before this thread starts.  Keep capture
+        # closed until that phrase (including any eSpeak fallback) is done,
+        # while the independent ultrasonic/main loops continue normally.
+        wait_for_idle = getattr(self.speech, "wait_until_idle", None)
+        if callable(wait_for_idle):
+            while (not self._stop_event.is_set()
+                   and not wait_for_idle(0.25)):
+                pass
         while not self._stop_event.is_set():
             mic = None
             try:
@@ -481,10 +489,10 @@ class VoiceAssistant(threading.Thread):
         self._set_state("SPEAKING")
         if self.speech is None or not self.speech.say(text):
             print("AUDIO ERROR: speech unavailable", flush=True); return False
-        deadline = time.monotonic() + config.SPEECH_MAX_HOLD_S + 3
         began = False
-        while time.monotonic() < deadline and not self._stop_event.is_set():
+        while not self._stop_event.is_set():
             active = self.speech.speaking
+            busy = getattr(self.speech, "busy", active)
             if active and not began:
                 began = True
                 print("TTS START", flush=True)
@@ -493,8 +501,10 @@ class VoiceAssistant(threading.Thread):
                         time.monotonic() - getattr(
                             self, "_end_of_speech_at", response_started_at)),
                         flush=True)
-            if began and not active:
+            if began and not busy:
                 print("SPEECH COMPLETE", flush=True); return True
+            if not began and not busy:
+                return False
             time.sleep(0.05)
         return False
 

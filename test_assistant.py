@@ -45,6 +45,30 @@ class WakeAckMic:
     def discard_pending(self): self.events.append("discard")
 
 
+class GeneratingWakeAckSpeech:
+    """Busy before playback, as Gemini is while generating its WAV."""
+    def __init__(self):
+        self.messages = []
+        self.phase = 0
+        self.ack_finished = False
+
+    def say(self, text):
+        self.messages.append(text)
+        return True
+
+    @property
+    def speaking(self):
+        return self.phase == 2
+
+    @property
+    def busy(self):
+        self.phase += 1
+        if self.phase >= 3:
+            self.ack_finished = True
+            return False
+        return True
+
+
 class FakeCameraReader:
     def __init__(self, frame=None): self.frame = frame; self.calls = 0
     def fresh_frame(self): self.calls += 1; return self.frame
@@ -78,6 +102,19 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(speech.messages, ["Yes, sir?"])
         self.assertEqual(events, ["discard", ("record", True)])
         voice._handle_request.assert_called_once()
+
+    def test_gemini_generation_and_ack_finish_before_listening(self):
+        speech = GeneratingWakeAckSpeech()
+        events = []
+        voice = assistant.VoiceAssistant(speech)
+        voice._handle_request = mock.Mock(
+            side_effect=lambda mic: events.append(
+                ("record", speech.ack_finished)))
+
+        voice._handle_wake_detected(WakeAckMic(events))
+
+        self.assertEqual(speech.messages, ["Yes, sir?"])
+        self.assertEqual(events, ["discard", ("record", True)])
 
     def test_wake_ack_failure_still_enters_request_listening(self):
         speech = mock.Mock()

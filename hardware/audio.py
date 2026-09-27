@@ -47,6 +47,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -759,7 +760,7 @@ class SpeechPlayer:
         self.description = "not opened"
 
     # ---------------------------------------------------------------- setup
-    def open(self):
+    def open(self, verify_playback=True):
         """Find a working TTS engine. Raises AudioError if there is none."""
         problems = []
         for command in SPEECH_BACKENDS:
@@ -802,7 +803,8 @@ class SpeechPlayer:
             # output-routing problem, and every other engine would fail on
             # the same device. Falling through would only bury the useful
             # error under "no TTS engine found".
-            self._verify_playback()
+            if verify_playback:
+                self._verify_playback()
             return self
 
         raise AudioError(
@@ -1025,6 +1027,134 @@ class SpeechPlayer:
         self._command = None
 
 
+class GeminiSpeechPlayer:
+    """Gemini-first player with transparent per-phrase offline fallback."""
+
+    def __init__(self, provider, fallback=None):
+        self.provider = provider
+        self.fallback = fallback
+        self.description = "{}; fallback {}".format(
+            provider.description,
+            fallback.description if fallback is not None else "unavailable",
+        )
+        self._process = None
+        self._wav_path = None
+        self._text = None
+        self._mode = None
+        self._gemini_failure = None
+        self._gemini_complete_logged = False
+
+    def speak(self, text):
+        self.stop()
+        self._text = text
+        self._gemini_failure = None
+        self._gemini_complete_logged = False
+        print("TTS: Gemini {}".format(self.provider.voice), flush=True)
+        try:
+            wav_bytes = self.provider.synthesize(text)
+            with tempfile.NamedTemporaryFile(
+                    prefix="sense-gemini-", suffix=".wav",
+                    delete=False) as sample:
+                sample.write(wav_bytes)
+                self._wav_path = sample.name
+            command = ["aplay", "-q"]
+            if config.AUDIO_DEVICE:
+                command += ["-D", config.AUDIO_DEVICE]
+            command.append(self._wav_path)
+            mark_speech_active()
+            self._process = subprocess.Popen(
+                command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            self._mode = "gemini"
+            return True
+        except Exception as exc:
+            self._gemini_failure = "{}: {}".format(type(exc).__name__, exc)
+            SPEECH_ACTIVE.clear()
+            self._cleanup_wav()
+            return self._start_fallback()
+
+    def _start_fallback(self):
+        print("TTS: Gemini failed - using eSpeak fallback", flush=True)
+        if self._gemini_failure:
+            print("TTS: Gemini error: {}".format(
+                " ".join(self._gemini_failure.split())[:240]), flush=True)
+        if self.fallback is None:
+            self._mode = "failed"
+            raise AudioError("Gemini TTS failed and eSpeak fallback is unavailable")
+        self._mode = "fallback"
+        self.fallback.speak(self._text)
+        return True
+
+    def is_speaking(self):
+        if self._mode == "gemini":
+            if self._process is not None and self._process.poll() is None:
+                return True
+            failure = self._gemini_playback_failure()
+            self._cleanup_wav()
+            SPEECH_ACTIVE.clear()
+            if failure:
+                self._gemini_failure = failure
+                self._process = None
+                self._start_fallback()
+                return self.fallback.is_speaking()
+            if not self._gemini_complete_logged:
+                print("TTS: Gemini complete", flush=True)
+                self._gemini_complete_logged = True
+            self._mode = "complete"
+            return False
+        if self._mode == "fallback":
+            return bool(self.fallback.is_speaking())
+        return False
+
+    def _gemini_playback_failure(self):
+        if self._process is None or self._process.returncode in (0, None, -15):
+            return None
+        detail = ""
+        try:
+            detail = self._process.stderr.read().decode(
+                "utf-8", "replace").strip()
+        except Exception:
+            pass
+        return "aplay exited {}{}".format(
+            self._process.returncode,
+            ": " + " ".join(detail.split())[:160] if detail else "",
+        )
+
+    def playback_failure(self):
+        if self._mode == "fallback":
+            return self.fallback.playback_failure()
+        if self._mode == "failed":
+            return self._gemini_failure or "Gemini TTS failed"
+        return None
+
+    def stop(self):
+        process, self._process = self._process, None
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+        if self.fallback is not None:
+            self.fallback.stop()
+        self._cleanup_wav()
+        self._mode = None
+        SPEECH_ACTIVE.clear()
+
+    def _cleanup_wav(self):
+        path, self._wav_path = self._wav_path, None
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def close(self):
+        self.stop()
+        self.provider.close()
+        if self.fallback is not None:
+            self.fallback.close()
+
+
 class SpeechController(threading.Thread):
     """Speaks the newest guidance, once, without ever blocking the caller.
 
@@ -1055,6 +1185,7 @@ class SpeechController(threading.Thread):
         self._now = now or time.monotonic
 
         self._pending_text = None
+        self._active_text = None
         self._muted = False
         self._last_text = None
         self._last_spoken_at = None
@@ -1153,6 +1284,25 @@ class SpeechController(threading.Thread):
             return False
 
     @property
+    def busy(self):
+        """True while a phrase is pending, generating, or playing.
+
+        Unlike ``speaking``, this includes cloud synthesis time.  The voice
+        assistant uses it to keep the microphone closed until its wake
+        acknowledgement has completely finished.  Beep timing intentionally
+        continues to use ``speaking``/SPEECH_ACTIVE, so network waits never
+        suppress local warnings.
+        """
+        with self._lock:
+            return self._pending_text is not None or self._active_text is not None
+
+    def wait_until_idle(self, timeout):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self.busy and time.monotonic() < deadline:
+            self._stop_event.wait(self.POLL_S)
+        return not self.busy
+
+    @property
     def error(self):
         with self._lock:
             return self._error
@@ -1180,12 +1330,17 @@ class SpeechController(threading.Thread):
                 muted = self._muted
                 if text is not None and not muted:
                     self._pending_text = None
+                    self._active_text = text
 
             if muted or text is None:
                 self._stop_event.wait(self.POLL_S)
                 continue
 
-            self._speak_now(text)
+            try:
+                self._speak_now(text)
+            finally:
+                with self._lock:
+                    self._active_text = None
 
     def _speak_now(self, text):
         """Speak one phrase, abandoning it if danger or shutdown arrives."""

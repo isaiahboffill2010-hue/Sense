@@ -209,31 +209,32 @@ about 8 cents. There is also a free tier.
 
 ## Spoken guidance (Phase 3)
 
-Accepted guidance is spoken through the same headphones as the beeps, using a
-**local offline** engine — no cloud TTS, nothing added to the Gemini round
-trip.
+All Sense speech uses **Gemini TTS with the Despina voice** as its primary
+voice. This includes startup, wake acknowledgement, assistant answers, and
+accepted navigation guidance. eSpeak NG remains the automatic offline fallback
+for API, network, quota, timeout, or generated-audio playback failures.
 
-Backends are tried in order; the first one present is used:
+Install the local fallback even when Gemini TTS is working:
 
 ```bash
-sudo apt install -y espeak-ng          # preferred
-# fallbacks: espeak, or libttspico-utils (pico2wave)
+sudo apt install -y espeak-ng
 ```
 
-If none is installed, the HUD shows `Speech: FAIL` with the install command
-and **everything else keeps working, beeps included**.
+If eSpeak NG is missing, Gemini speech can still start but Sense logs that its
+offline fallback is unavailable. If neither provider can start, speech is
+marked failed and **everything else keeps working, beeps included**.
 
-### Safety: danger always wins
+### Safety: local warnings remain independent
 
 Speech runs on its own thread, separate from the beeps, for one reason: a
 spoken phrase takes a second or two and a danger beep must never queue behind
 it.
 
 - The beeps are driven **straight from the ultrasonic reading**, first, every
-  frame. They never wait on Gemini or on speech.
-- Entering `DANGER` **silences speech and cuts off any phrase mid-word**
-  (`SPEECH_MUTE_IN_DANGER`), so the rapid danger beeps are never competing
-  with a sentence.
+  frame. They never wait on Gemini or on speech generation.
+- Beeps continue during network synthesis. Once the WAV is ready,
+  `SPEECH_ACTIVE` makes the beeper stand aside for playback and it resumes as
+  soon as Despina (or the eSpeak fallback) finishes.
 - Gemini is supplemental scene understanding. It is not, and must never
   become, part of the collision-detection path.
 
@@ -383,13 +384,13 @@ would break Phase 1. Use either:
 
 ```bash
 # (a) user install - leaves the working Phase 1 environment untouched
-pip3 install --user --break-system-packages google-genai
+pip3 install --user --break-system-packages 'google-genai>=2.25.0'
 ```
 
 ```bash
 # (b) or a venv that can still see the system packages
 python3 -m venv --system-site-packages ~/sense-venv
-~/sense-venv/bin/pip install google-genai
+~/sense-venv/bin/pip install 'google-genai>=2.25.0'
 ~/sense-venv/bin/python main.py
 ```
 

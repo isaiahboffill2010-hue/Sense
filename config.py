@@ -551,14 +551,30 @@ GEMINI_PROMPT = (
 # ==========================================================================
 # 7. SPOKEN NAVIGATION  (Phase 3)
 # ==========================================================================
-# Accepted Gemini guidance is spoken through the same headphones as the
-# beeps, using a local offline text-to-speech engine. No network, no cloud
-# TTS, nothing added to the Gemini round trip.
+# Accepted guidance and assistant replies use Gemini TTS first.  The local
+# eSpeak path remains available for every phrase when the network/API or
+# generated-audio playback fails.
 #
 # The beep system is completely untouched by this. Speech runs on its own
 # thread so a 2-second phrase can never delay a danger beep.
 
 SPEECH_ENABLED = True
+
+GEMINI_TTS_MODEL = os.environ.get(
+    "GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Despina")
+GEMINI_TTS_TIMEOUT_S = float(os.environ.get("GEMINI_TTS_TIMEOUT_S", "10"))
+GEMINI_TTS_STYLE = (
+    "Warm, calm, and reassuring female accessibility assistant. Speak in a "
+    "slightly lower, warm register with smooth natural phrasing, clear "
+    "pronunciation, and a confident but friendly conversational delivery. "
+    "Do not sound like an announcer."
+)
+
+# About +3 dB when the source has enough headroom.  The PCM peak limiter keeps
+# every boosted sample below 92% of full scale, avoiding clipping/distortion.
+GEMINI_TTS_VOLUME_BOOST = 1.4
+GEMINI_TTS_PEAK_CEILING = 0.92
 
 # Words per minute. Assistive speech wants to be brisk but intelligible;
 # espeak's default 175 is a reasonable middle.

@@ -10,7 +10,6 @@ This script only calls Gemini and plays the returned WAV.  It does not import
 or modify SpeechPlayer, so Sense continues to use eSpeak NG.
 """
 
-import base64
 import os
 import shutil
 import subprocess
@@ -18,6 +17,7 @@ import sys
 import tempfile
 
 import config  # Loads GEMINI_API_KEY from .env.local.
+from gemini_tts import GeminiTTSProvider
 
 
 MODEL = "gemini-3.8-flash-tts"
@@ -53,73 +53,22 @@ def _audio_device():
         config.AUDIO_DEVICE or DEFAULT_AUDIO_DEVICE
 
 
-def _api_key():
-    key = os.environ.get(config.GEMINI_API_KEY_ENV, "").strip()
-    if not key:
-        raise VoiceTestError(
-            "GEMINI_API_KEY is missing. Add it to ~/Sense/.env.local."
-        )
-    return key
-
-
-def _client():
+def _provider():
     try:
-        from google import genai
-    except ImportError as exc:
+        return GeminiTTSProvider(
+            model=MODEL,
+            voice="Despina",
+            style=STYLE,
+            timeout_s=config.GEMINI_TTS_TIMEOUT_S,
+            volume_boost=config.GEMINI_TTS_VOLUME_BOOST,
+            peak_ceiling=config.GEMINI_TTS_PEAK_CEILING,
+        ).open()
+    except Exception as exc:
         raise VoiceTestError(
-            "The current Google Gen AI SDK is required. Install/upgrade it "
-            "with:\n  pip3 install --user --break-system-packages "
-            "'google-genai>=2.25.0'"
+            "Could not open Gemini TTS: {}: {}\nInstall/upgrade with:\n  "
+            "pip3 install --user --break-system-packages "
+            "'google-genai>=2.25.0'".format(type(exc).__name__, exc)
         ) from exc
-
-    client = genai.Client(api_key=_api_key())
-    if not hasattr(client, "interactions"):
-        raise VoiceTestError(
-            "google-genai is too old for the Gemini TTS Interactions API. "
-            "Upgrade it with:\n  pip3 install --user --break-system-packages "
-            "'google-genai>=2.25.0'"
-        )
-    return client
-
-
-def generate_wav(client, voice):
-    """Generate the fixed audition phrase and return complete WAV bytes."""
-    interaction = client.interactions.create(
-        model=MODEL,
-        input=[{
-            "type": "user_input",
-            "content": [{
-                "type": "text",
-                "text": SAMPLE_TEXT,
-                "annotations": [{
-                    "type": "speech_metadata",
-                    "style": STYLE,
-                }],
-            }],
-        }],
-        response_format={"type": "audio"},
-        generation_config={
-            "speech_config": [{"voice": voice}],
-        },
-    )
-
-    output_audio = getattr(interaction, "output_audio", None)
-    encoded = getattr(output_audio, "data", None)
-    if not encoded:
-        raise VoiceTestError("Gemini returned no audio for {}.".format(voice))
-
-    try:
-        wav = base64.b64decode(encoded, validate=True)
-    except (ValueError, TypeError) as exc:
-        raise VoiceTestError(
-            "Gemini returned invalid audio for {}.".format(voice)
-        ) from exc
-
-    if not wav.startswith(b"RIFF") or wav[8:12] != b"WAVE":
-        raise VoiceTestError(
-            "Gemini did not return the expected WAV audio for {}.".format(voice)
-        )
-    return wav
 
 
 def play_wav(wav, voice):
@@ -160,9 +109,9 @@ def play_wav(wav, voice):
                 pass
 
 
-def audition(client, voice, character):
+def audition(provider, voice, character):
     print("\nGenerating {} ({})...".format(voice, character), flush=True)
-    wav = generate_wav(client, voice)
+    wav = provider.synthesize(SAMPLE_TEXT, voice=voice)
     print("Playing through {}...".format(_audio_device()), flush=True)
     play_wav(wav, voice)
     print("Finished {}.".format(voice), flush=True)
@@ -181,7 +130,7 @@ def _print_menu():
 
 def main():
     try:
-        client = _client()
+        provider = _provider()
     except VoiceTestError as exc:
         print("ERROR: {}".format(exc), file=sys.stderr)
         return 1
@@ -210,7 +159,7 @@ def main():
 
         for voice, character in selected:
             try:
-                audition(client, voice, character)
+                audition(provider, voice, character)
             except Exception as exc:
                 print(
                     "ERROR testing {}: {}: {}".format(

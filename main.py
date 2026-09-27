@@ -647,9 +647,9 @@ def start_vision(args, states):
 
 
 def start_speech(args, states):
-    """Open offline text-to-speech. Returns (player, controller) or (None, None).
+    """Open Gemini-first TTS with offline fallback.
 
-    Never fatal: if there is no TTS engine installed, the beeps, the HUD and
+    Never fatal: if no voice can be opened, the beeps, HUD, sensors, and
     everything else carry on exactly as before.
     """
     if args.skip_speech or not config.SPEECH_ENABLED:
@@ -659,13 +659,40 @@ def start_speech(args, states):
         return None, None
 
     print("Speech: checking...", flush=True)
-    from hardware.audio import AudioError, SpeechController, SpeechPlayer
+    from hardware.audio import (
+        AudioError, GeminiSpeechPlayer, SpeechController, SpeechPlayer,
+    )
 
+    fallback = None
     try:
-        player = SpeechPlayer().open()
+        # Probe the local binary without speaking the startup phrase in the
+        # old voice.  It will be exercised automatically if Gemini fails.
+        fallback = SpeechPlayer().open(verify_playback=False)
     except AudioError as exc:
-        states["Speech"] = (STATUS_FAIL, str(exc))
-        print("SPEECH ERROR: {}".format(exc))
+        print("TTS: eSpeak fallback unavailable - {}".format(exc), flush=True)
+
+    player = None
+    try:
+        from gemini_tts import GeminiTTSProvider
+        provider = GeminiTTSProvider(
+            model=config.GEMINI_TTS_MODEL,
+            voice=config.GEMINI_TTS_VOICE,
+            style=config.GEMINI_TTS_STYLE,
+            timeout_s=config.GEMINI_TTS_TIMEOUT_S,
+            volume_boost=config.GEMINI_TTS_VOLUME_BOOST,
+            peak_ceiling=config.GEMINI_TTS_PEAK_CEILING,
+        ).open()
+        player = GeminiSpeechPlayer(provider, fallback)
+    except Exception as exc:
+        print("TTS: Gemini failed - using eSpeak fallback", flush=True)
+        print("TTS: Gemini setup error: {}: {}".format(
+            type(exc).__name__, exc), flush=True)
+        player = fallback
+
+    if player is None:
+        message = "Gemini TTS and offline speech fallback are unavailable"
+        states["Speech"] = (STATUS_FAIL, message)
+        print("SPEECH ERROR: {}".format(message))
         return None, None
 
     controller = SpeechController(player)
@@ -674,11 +701,12 @@ def start_speech(args, states):
     print("Speech: OK - {}".format(player.description))
     print("       device: {}".format(
         config.AUDIO_DEVICE or "system default"))
-    # open() already spoke the startup phrase, synchronously, and checked
-    # the exit codes - so reaching here means audio really played on that
-    # device. Saying it again here would just duplicate it.
-    print('       spoke "{}" on that device - did you hear it in the '
-          'headphones?'.format(config.SPEECH_STARTUP_PHRASE))
+    # Queue this on the speech worker and return immediately.  Waiting for a
+    # cloud request here would delay entry into the ultrasonic safety loop.
+    # VoiceAssistant waits for this phrase before opening its listening mic.
+    controller.say(config.SPEECH_STARTUP_PHRASE)
+    print('       queued "{}" on the speech worker'.format(
+        config.SPEECH_STARTUP_PHRASE))
     return player, controller
 
 
