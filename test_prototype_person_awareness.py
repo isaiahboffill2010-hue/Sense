@@ -1,6 +1,7 @@
 from collections import deque
 from types import SimpleNamespace
 import unittest
+import inspect
 from prototype_camera_motion import CAMERA_STABLE,CAMERA_UNCERTAIN,CameraMotion
 from prototype_person_awareness import *
 def cam(s=CAMERA_STABLE,dx=0):return CameraMotion(dx,0,s,"HIGH",20,20)
@@ -18,3 +19,6 @@ class T(unittest.TestCase):
  def test_event_group_top(self):
   e=PersonEngine();x=person(centers=[0,30]);self.assertEqual(e.observe([x],cam())[0].event,"NEW");self.assertEqual(e.observe([x],cam())[0].event,"ONGOING");items=e.observe([person(i=1,centers=[0,30]),person(i=2,centers=[0,30]),person(i=3),person(i=4)],cam());self.assertEqual(len(format_top(items)),3);self.assertIn("moving right",group_motion(items,cam()))
  def test_forbidden_cli(self):self.assertNotIn("SAFE TO CROSS",console([],cam()));self.assertEqual(parse_args(["--benchmark-seconds","60"]).benchmark_seconds,60)
+ def test_runtime_wiring_exists(self):
+  import prototype_person_awareness as module
+  source=inspect.getsource(module.main);self.assertIn("CameraReader",source);self.assertIn("LiteRTDetector",source);self.assertIn("LightweightTracker",source);self.assertIn("SparseCameraMotionEstimator",source);self.assertIn("while True",source)

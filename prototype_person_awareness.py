@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Phase 7.5 local person-awareness logic; observations only."""
 from __future__ import annotations
-import argparse, statistics
+import argparse, statistics, sys, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
-from prototype_camera_motion import CAMERA_UNCERTAIN, corrected_motion
+from prototype_camera_motion import CAMERA_UNCERTAIN, MotionSmoother, SparseCameraMotionEstimator, corrected_motion
+from prototype_motion_tracking import LightweightTracker
+from prototype_vision import DEFAULT_LABELS, DEFAULT_MODEL, LiteRTDetector, NewestFrameGate
 
 HIGH,MEDIUM,LOW="HIGH","MEDIUM","LOW"
 NO_APPROACH,POSSIBLE_APPROACH,APPROACH_UNCERTAIN="NO APPROACH EVIDENCE","POSSIBLE APPROACH","APPROACH UNCERTAIN"
@@ -53,6 +55,42 @@ def group_motion(items,camera):
 def format_top(items):return [f"{x.track.display_id} | {x.level} | {x.transition} | {x.approach}" for x in items[:3]]
 def console(items,camera):return f"PEOPLE: {len(items)} tracked | TOP: "+("; ".join(format_top(items)) if items else "none")+(" | MOTION: UNCERTAIN" if camera.state==CAMERA_UNCERTAIN else "")
 def parse_args(argv:Sequence[str]|None=None):
- p=argparse.ArgumentParser();p.add_argument("--benchmark-seconds",type=float,default=0);p.add_argument("--no-preview",action="store_true");p.add_argument("--debug-people",action="store_true");a=p.parse_args(argv)
+ p=argparse.ArgumentParser();p.add_argument("--model",type=Path,default=DEFAULT_MODEL);p.add_argument("--labels",type=Path,default=DEFAULT_LABELS);p.add_argument("--confidence",type=float,default=.5);p.add_argument("--max-detection-fps",type=float,default=5);p.add_argument("--threads",type=int,default=2);p.add_argument("--camera-width",type=int,default=640);p.add_argument("--camera-height",type=int,default=480);p.add_argument("--benchmark-seconds",type=float,default=0);p.add_argument("--no-preview",action="store_true");p.add_argument("--debug-people",action="store_true");a=p.parse_args(argv)
  if a.benchmark_seconds<0:p.error("invalid benchmark duration")
  return a
+def main(argv=None):
+ a=parse_args(argv)
+ if not a.model.is_file() or not a.labels.is_file():print("MISSING MODEL ASSET: run python3 download_prototype_model.py",file=sys.stderr);return 2
+ try:
+  from hardware.camera import Camera,CameraError,CameraReader
+  detector=LiteRTDetector(a.model,a.labels,a.threads)
+ except Exception as e:print(f"PHASE 7.5 STARTUP FAILED: {type(e).__name__}: {e}",file=sys.stderr);return 2
+ camera=reader=None;started=time.monotonic();last=next_log=0.;engine=PersonEngine();tracker=LightweightTracker();smoother=MotionSmoother();gate=NewestFrameGate()
+ print("SENSE PHASE 7.5 PERSON PROTOTYPE | Gemini/cloud/audio/navigation: DISABLED",flush=True)
+ try:
+  camera=Camera(resolution=(a.camera_width,a.camera_height),pixel_format="RGB888").open();reader=CameraReader(camera);reader.start();estimator=SparseCameraMotionEstimator(detector.cv2,detector.np)
+  while True:
+   now=time.monotonic()
+   if a.benchmark_seconds and now-started>=a.benchmark_seconds:break
+   if now-last<1/a.max_detection_fps:time.sleep(.002);continue
+   frame,_=reader.latest()
+   if frame is None or not gate.accept(id(frame)):time.sleep(.002);continue
+   last=now;detections,_=detector.detect(frame,a.confidence);motion=smoother.update(estimator.update(frame,detections)[0]);tracker.update(detections,time.monotonic());items=engine.observe(tracker.tracks_for_display(),motion,(frame.shape[1],frame.shape[0]))
+   if now>=next_log:
+    print(console(items,motion),flush=True)
+    if a.debug_people:
+     for item in items:print(f"DEBUG {item.track.display_id}: box={item.track.box} zone={item.track.position} motion={item.motion} approach={item.approach} ahead={item.ahead} score={item.score} reasons={item.reasons} event={item.event}",flush=True)
+    next_log=now+1
+   if not a.no_preview:
+    for item in items:
+     l,t,r,b=item.track.box;detector.cv2.rectangle(frame,(l,t),(r,b),(0,220,220),2);detector.cv2.putText(frame,f"{item.track.display_id} {item.level} {item.approach}",(l,max(18,t-6)),detector.cv2.FONT_HERSHEY_SIMPLEX,.42,(0,220,220),1)
+    detector.cv2.imshow("Sense Phase 7.5 person prototype",frame)
+    if detector.cv2.waitKey(1)&0xFF in (ord('q'),27):break
+ except KeyboardInterrupt:pass
+ except CameraError as e:print(f"CAMERA FAILED: {e}",file=sys.stderr);return 3
+ finally:
+  if reader:reader.stop()
+  if camera:camera.close()
+  if not a.no_preview:detector.cv2.destroyAllWindows()
+ return 0
+if __name__=="__main__":raise SystemExit(main())
