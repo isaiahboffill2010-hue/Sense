@@ -62,7 +62,8 @@
 # Verify before running the app:
 #     python3 smoke_test_gemini.py
 #
-google-genai>=1.0.0
+# 2.25 adds the current Gemini TTS Interactions/Voices APIs.
+google-genai>=2.25.0
 pocketsphinx>=5.0.0
 #
 # Do NOT install `google-generativeai` - that SDK is deprecated.
