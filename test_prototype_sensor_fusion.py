@@ -9,6 +9,7 @@ from prototype_sensor_fusion import (
     ASSOCIATION_POSSIBLE,
     ASSOCIATION_STALE,
     Detection,
+    FusionStats,
     association_zone,
     distance_band,
     fuse,
@@ -97,6 +98,17 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(result.forward_distance_cm, 23)
         self.assertEqual(result.distance_band, "VERY CLOSE")
         self.assertEqual(result.association, ASSOCIATION_NONE)
+
+
+class FusionMetricsTests(unittest.TestCase):
+    def test_benchmark_reports_total_cycle_and_fusion_time(self):
+        stats = FusionStats(started_at=0)
+        result = fuse([], snapshot(), .02, 300, .34, .25, .50, .75, .5)
+        for _ in range(5):
+            stats.add(200, 205, .1, snapshot(), {"cpu": 80, "rss": 42, "temp": 60}, result)
+        report = stats.summary(1, 10)
+        self.assertIn("Average total cycle: 205.0 ms", report)
+        self.assertIn("Average fusion time: 0.1 ms", report)
 
 
 if __name__ == "__main__":

@@ -175,6 +175,7 @@ class FusionStats:
             f"Detection FPS: {self._value(len(self.inference_ms) / elapsed_s if elapsed_s > 0 else None)}",
             f"Average inference: {self._value(statistics.fmean(self.inference_ms) if self.inference_ms else None, ' ms')}",
             f"P95 inference: {self._value(percentile(self.inference_ms, 95) if enough else None, ' ms')}",
+            f"Average total cycle: {self._value(statistics.fmean(self.total_ms) if self.total_ms else None, ' ms')}",
             f"Ultrasonic update rate: {self._value(reading_count / elapsed_s if elapsed_s > 0 else None, ' Hz')}",
             f"Average ultrasonic age: {self._value(statistics.fmean(self.ultrasonic_age_ms) if self.ultrasonic_age_ms else None, ' ms')}",
             f"P95 ultrasonic age: {self._value(percentile(self.ultrasonic_age_ms, 95) if len(self.ultrasonic_age_ms) >= 5 else None, ' ms')}",
@@ -213,8 +214,8 @@ def draw_preview(frame, detections: Iterable[Detection], result: FusionResult, m
     lines = (
         distance_text,
         association_text,
-        "AI {}ms detect {}fps | ultrasonic age {}ms {}Hz | fusion {}ms".format(
-            format_metric(metrics["inference"]), format_metric(metrics["detection_fps"]),
+        "AI {}ms cycle {}ms detect {}fps | ultrasonic age {}ms {}Hz | fusion {}ms".format(
+            format_metric(metrics["inference"]), format_metric(metrics["total"]), format_metric(metrics["detection_fps"]),
             format_metric(metrics["ultrasonic_age"]), format_metric(metrics["ultrasonic_hz"]),
             format_metric(metrics["fusion"]),
         ),
@@ -333,7 +334,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             system = system_monitor.sample()
             ultrasonic_hz = snapshot["reading_count"] / max(.001, time.monotonic() - stats.started_at)
             metrics = {
-                "inference": inference_ms, "detection_fps": detection_fps, "fusion": fusion_ms,
+                "inference": inference_ms, "total": total_ms, "detection_fps": detection_fps, "fusion": fusion_ms,
                 "vision_age": vision_age_s * 1000.0,
                 "ultrasonic_age": None if snapshot["age_s"] is None else snapshot["age_s"] * 1000.0,
                 "ultrasonic_hz": ultrasonic_hz, **system,
