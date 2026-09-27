@@ -1,0 +1,2 @@
+# Kept separate from Sense's production requirements on purpose.
+ai-edge-litert==2.2.0

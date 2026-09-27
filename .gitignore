@@ -16,6 +16,9 @@ env/
 assets/*.wav
 *.log
 captures/
+models/*.tflite
+models/coco_labels.txt
+.venv-vision/
 
 # --- Editors / OS ---
 .vscode/
