@@ -254,6 +254,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def run_ultrasonic_only(ultrasonic, sensor, args, start_error: str) -> int:
+    """Keep the physical sensor observable if local vision cannot start."""
+    stats = FusionStats()
+    next_log = 0.0
+    print(f"LOCAL VISION UNAVAILABLE: {start_error}", file=sys.stderr)
+    print("Continuing ultrasonic-only prototype mode; no object identity will be shown.", flush=True)
+    try:
+        while not args.benchmark_seconds or time.monotonic() - stats.started_at < args.benchmark_seconds:
+            snapshot = ultrasonic.snapshot()
+            result = fuse([], snapshot, None, args.camera_width, args.association_zone_width,
+                          args.association_min_overlap, args.confidence, args.vision_max_age,
+                          args.ultrasonic_max_age)
+            if time.monotonic() >= next_log:
+                forward = "DISTANCE UNAVAILABLE" if result.forward_distance_cm is None else (
+                    f"{result.forward_distance_cm:.0f} cm ({result.distance_band})"
+                )
+                print(f"FORWARD OBSTACLE: {forward} | {result.association}", flush=True)
+                next_log = time.monotonic() + 1.0
+            time.sleep(.05)
+    except KeyboardInterrupt:
+        print("Stopping on Ctrl-C.", flush=True)
+    finally:
+        elapsed = time.monotonic() - stats.started_at
+        readings = ultrasonic.snapshot()["reading_count"]
+        ultrasonic.stop()
+        sensor.close()
+        print(stats.summary(elapsed, readings), flush=True)
+    return 3
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     for asset in (args.model, args.labels):
@@ -263,7 +293,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         from hardware.camera import Camera, CameraError, CameraReader
         from hardware.ultrasonic import UltrasonicError, UltrasonicMonitor, UltrasonicSensor
-        detector = LiteRTDetector(args.model, args.labels, args.threads)
     except Exception as exc:
         print(f"PHASE 2 STARTUP FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
@@ -279,6 +308,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UltrasonicError as exc:
         ultrasonic_start_error = str(exc)
         print(f"ULTRASONIC UNAVAILABLE: {exc}\nVision will continue; no distance will be invented.", flush=True)
+
+    try:
+        detector = LiteRTDetector(args.model, args.labels, args.threads)
+    except Exception as exc:
+        if ultrasonic is not None and sensor is not None:
+            return run_ultrasonic_only(ultrasonic, sensor, args, f"{type(exc).__name__}: {exc}")
+        if sensor is not None:
+            sensor.close()
+        print(f"PHASE 2 STARTUP FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
 
     stats = FusionStats()
     system_monitor = SystemMonitor()
