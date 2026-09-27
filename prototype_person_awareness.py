@@ -12,6 +12,7 @@ from prototype_vision import DEFAULT_LABELS, DEFAULT_MODEL, LiteRTDetector, Newe
 HIGH,MEDIUM,LOW="HIGH","MEDIUM","LOW"
 NO_APPROACH,POSSIBLE_APPROACH,APPROACH_UNCERTAIN="NO APPROACH EVIDENCE","POSSIBLE APPROACH","APPROACH UNCERTAIN"
 MIN_APPROACH_SAMPLES=4; MIN_SCALE_GROWTH=.18; AHEAD_MIN_AREA=.045; AHEAD_MIN_WIDTH=.16
+MAX_CENTER_SPAN_FOR_APPROACH=.22; STRONG_LATERAL_SPAN=.45; EDGE_MARGIN_FRACTION=.08
 @dataclass(frozen=True)
 class PersonObservation:
  track:object;level:str;score:int;motion:str;transition:str;crossing:str|None;approach:str;ahead:bool;forward_attention:bool;reasons:tuple[str,...];event:str
@@ -23,6 +24,17 @@ def crossing(hist):
  z=[x.position for x in hist]
  if len(z)>=3 and z[-3:]==["LEFT","CENTER","RIGHT"]:return "CROSSING LEFT→RIGHT"
  if len(z)>=3 and z[-3:]==["RIGHT","CENTER","LEFT"]:return "CROSSING RIGHT→LEFT"
+def approach_evidence(hist,motion,camera,frame_width):
+ if camera.state==CAMERA_UNCERTAIN:return APPROACH_UNCERTAIN,("suppressed: camera motion uncertain",)
+ if len(hist)<MIN_APPROACH_SAMPLES:return NO_APPROACH,("insufficient scale history",)
+ areas=[x.area for x in hist];growth=(statistics.median(areas[-2:])-statistics.median(areas[:2]))/max(1,statistics.median(areas[:2]))
+ centers=[x.center_x/frame_width for x in hist];span=max(centers)-min(centers);zones=[x.position for x in hist];cross=crossing(hist)
+ edge_entry=min(centers[:2])<=EDGE_MARGIN_FRACTION or max(centers[:2])>=1-EDGE_MARGIN_FRACTION
+ if growth<MIN_SCALE_GROWTH:return NO_APPROACH,("no sustained scale growth",)
+ if cross or (motion.startswith("MOVING") and span>=STRONG_LATERAL_SPAN):return NO_APPROACH,("scale growth","suppressed: strong lateral traversal")
+ if edge_entry and span>MAX_CENTER_SPAN_FOR_APPROACH:return NO_APPROACH,("scale growth","suppressed: edge entry")
+ if span<=MAX_CENTER_SPAN_FOR_APPROACH and zones[-1]=="CENTER":return POSSIBLE_APPROACH,("sustained scale growth","center stable","persistent center")
+ return NO_APPROACH,("scale growth","insufficient center stability")
 class PersonEngine:
  def __init__(self):self.previous={};self.events={}
  def observe(self,tracks:Iterable[object],camera,frame=(640,480)):
@@ -30,10 +42,7 @@ class PersonEngine:
   for t in tracks:
    if t.label!="person" or not t.confirmed or not t.seen_this_update:continue
    key=(t.label,t.track_id);hist=list(t.history);prev=self.previous.get(key,hist[-2].position if len(hist)>1 else None);tr=transition(prev,t.position);self.previous[key]=t.position;cross=crossing(hist);motion=corrected_motion(t,camera)
-   approach=APPROACH_UNCERTAIN if camera.state==CAMERA_UNCERTAIN else NO_APPROACH
-   if camera.state!=CAMERA_UNCERTAIN and len(hist)>=MIN_APPROACH_SAMPLES:
-    a=[x.area for x in hist];g=(statistics.median(a[-2:])-statistics.median(a[:2]))/max(1,statistics.median(a[:2]))
-    if g>=MIN_SCALE_GROWTH:approach=POSSIBLE_APPROACH
+   approach,approach_reasons=approach_evidence(hist,motion,camera,frame[0])
    l,top,r,b=t.box;w,h=frame;ahead=t.position=="CENTER" and (r-l)/w>=AHEAD_MIN_WIDTH and (r-l)*(b-top)/(w*h)>=AHEAD_MIN_AREA;forward=ahead and approach==POSSIBLE_APPROACH
    score=1;reasons=["persistent track"]
    if t.position=="CENTER":score+=2;reasons+= ["center"]
@@ -42,6 +51,7 @@ class PersonEngine:
    if tr.startswith("ENTERING"):score+=3;reasons += ["entering center"]
    if cross:score+=2;reasons += ["crossing center"]
    if approach==POSSIBLE_APPROACH:score+=3;reasons += ["possible approach"]
+   reasons += list(approach_reasons)
    if ahead:score+=2;reasons += ["person ahead"]
    if forward:score+=2;reasons += ["forward person attention"]
    level=HIGH if score>=8 else MEDIUM if score>=4 else LOW;sig=(level,tr,cross,approach,ahead);old=self.events.get(key);event="NEW" if old is None else "ONGOING" if old==sig else "CHANGED";self.events[key]=sig
@@ -79,7 +89,7 @@ def main(argv=None):
    if now>=next_log:
     print(console(items,motion),flush=True)
     if a.debug_people:
-     for item in items:print(f"DEBUG {item.track.display_id}: box={item.track.box} zone={item.track.position} motion={item.motion} approach={item.approach} ahead={item.ahead} score={item.score} reasons={item.reasons} event={item.event}",flush=True)
+     for item in items:print(f"DEBUG {item.track.display_id}: box={item.track.box} zone={item.track.position} motion={item.motion} approach={item.approach} reasons={item.reasons} ahead={item.ahead} score={item.score} event={item.event}",flush=True)
     next_log=now+1
    if not a.no_preview:
     for item in items:

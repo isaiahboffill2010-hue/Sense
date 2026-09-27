@@ -15,6 +15,10 @@ class T(unittest.TestCase):
  def test_side_tentative(self):self.assertEqual(PersonEngine().observe([person()],cam())[0].level,LOW);self.assertFalse(PersonEngine().observe([person(ok=False)],cam()))
  def test_approach(self):
   self.assertNotEqual(PersonEngine().observe([person("CENTER",areas=[1000,1400])],cam())[0].approach,POSSIBLE_APPROACH);self.assertEqual(PersonEngine().observe([person("CENTER",pos=["CENTER"]*4,areas=[1000,1250,1500,1800])],cam())[0].approach,POSSIBLE_APPROACH)
+ def test_lateral_crossing_growth_is_not_approach(self):
+  p=person("RIGHT",pos=["LEFT","LEFT","CENTER","RIGHT"],areas=[1000,1300,1600,1900],centers=[60,120,300,500]);item=PersonEngine().observe([p],cam())[0];self.assertEqual(item.crossing,"CROSSING LEFT→RIGHT");self.assertEqual(item.approach,NO_APPROACH);self.assertIn("suppressed: strong lateral traversal",item.reasons)
+ def test_diagonal_but_stable_center_can_approach(self):
+  p=person("CENTER",pos=["CENTER"]*4,areas=[1000,1250,1500,1800],centers=[300,310,305,315]);self.assertEqual(PersonEngine().observe([p],cam())[0].approach,POSSIBLE_APPROACH)
  def test_ahead(self):self.assertTrue(PersonEngine().observe([person("CENTER")],cam())[0].ahead)
  def test_event_group_top(self):
   e=PersonEngine();x=person(centers=[0,30]);self.assertEqual(e.observe([x],cam())[0].event,"NEW");self.assertEqual(e.observe([x],cam())[0].event,"ONGOING");items=e.observe([person(i=1,centers=[0,30]),person(i=2,centers=[0,30]),person(i=3),person(i=4)],cam());self.assertEqual(len(format_top(items)),3);self.assertIn("moving right",group_motion(items,cam()))
