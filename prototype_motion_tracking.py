@@ -73,8 +73,11 @@ class Track:
     confidence: float
     position: str
     history: deque[Observation]
+    hit_times: deque[float]
+    confirmed: bool = False
     motion: str = STABLE
     seen_this_update: bool = True
+    was_lost: bool = False
 
     @property
     def display_id(self) -> str:
@@ -83,12 +86,18 @@ class Track:
 
 class LightweightTracker:
     """Short-lived class-aware IoU + centre-distance object tracker."""
-    def __init__(self, *, max_center_distance_px: float = 120.0, min_iou: float = .10,
-                 lost_timeout_s: float = 1.50, history_size: int = 6,
+    def __init__(self, *, max_center_distance_px: float = 120.0, priority_center_distance_px: float = 200.0,
+                 min_iou: float = .10, lost_timeout_s: float = 1.25,
+                 priority_lost_timeout_s: float = 2.0, confirmation_hits: int = 2,
+                 confirmation_window_s: float = .75, history_size: int = 6,
                  horizontal_dead_zone_px: float = 35.0, area_change_ratio: float = 1.25):
         self.max_center_distance_px = max_center_distance_px
+        self.priority_center_distance_px = priority_center_distance_px
         self.min_iou = min_iou
         self.lost_timeout_s = lost_timeout_s
+        self.priority_lost_timeout_s = priority_lost_timeout_s
+        self.confirmation_hits = confirmation_hits
+        self.confirmation_window_s = confirmation_window_s
         self.history_size = history_size
         self.horizontal_dead_zone_px = horizontal_dead_zone_px
         self.area_change_ratio = area_change_ratio
@@ -105,20 +114,76 @@ class LightweightTracker:
             priority_for(detection.label), now, now, detection.confidence, detection.position,
             deque([Observation(now, center_x, center_y, box_area(detection.box), detection.confidence,
                                detection.position)], maxlen=self.history_size),
+            deque([now], maxlen=self.confirmation_hits),
         )
         self.created_count += 1
         return track
 
     def _update_track(self, track: Track, detection: Detection, now: float) -> None:
         center_x, center_y = box_center(detection.box)
+        reacquired = track.was_lost
         track.box = detection.box
         track.confidence = detection.confidence
         track.position = detection.position
         track.last_seen_at = now
         track.seen_this_update = True
+        if reacquired:
+            # Do not turn a blind interval into an invented huge movement.
+            track.history.clear()
+            track.motion = STABLE
         track.history.append(Observation(now, center_x, center_y, box_area(detection.box),
                                          detection.confidence, detection.position))
-        track.motion = self._motion(track)
+        track.hit_times.append(now)
+        while track.hit_times and now - track.hit_times[0] > self.confirmation_window_s:
+            track.hit_times.popleft()
+        if len(track.hit_times) >= self.confirmation_hits:
+            track.confirmed = True
+        if not reacquired:
+            track.motion = self._motion(track)
+
+    @staticmethod
+    def _predicted_center(track: Track, now: float) -> tuple[float, float]:
+        history = list(track.history)
+        current_x, current_y = box_center(track.box)
+        if len(history) < 2:
+            return current_x, current_y
+        previous, last = history[-2], history[-1]
+        elapsed = max(.001, last.timestamp - previous.timestamp)
+        ahead = min(1.0, max(0.0, now - last.timestamp))
+        return last.center_x + (last.center_x - previous.center_x) / elapsed * ahead, last.center_y + (last.center_y - previous.center_y) / elapsed * ahead
+
+    def _match_score(self, track: Track, detection: Detection, now: float) -> float | None:
+        if track.class_id != detection.class_id or track.label != detection.label:
+            return None
+        current_x, current_y = box_center(track.box)
+        detected_x, detected_y = box_center(detection.box)
+        predicted_x, predicted_y = self._predicted_center(track, now)
+        current_distance = ((detected_x - current_x) ** 2 + (detected_y - current_y) ** 2) ** .5
+        predicted_distance = ((detected_x - predicted_x) ** 2 + (detected_y - predicted_y) ** 2) ** .5
+        tolerance = self.priority_center_distance_px if track.priority == "HIGH" else self.max_center_distance_px
+        overlap = iou(track.box, detection.box)
+        old_area, new_area = box_area(track.box), box_area(detection.box)
+        size_ratio = 1.0 if not old_area or not new_area else min(old_area, new_area) / max(old_area, new_area)
+        minimum_size_ratio = .25 if track.priority == "HIGH" else .35
+        if size_ratio < minimum_size_ratio or (overlap < self.min_iou and min(current_distance, predicted_distance) > tolerance):
+            return None
+        # Prediction dominates when a moving track is briefly lost; confirmed
+        # tracks get a small, bounded preference over a new tentative identity.
+        score = (.25 * current_distance / tolerance + .45 * predicted_distance / tolerance +
+                 .20 * (1.0 - overlap) + .10 * (1.0 - size_ratio))
+        if track.confirmed:
+            score -= .08
+        return score
+
+    def _is_duplicate_person(self, detection: Detection) -> bool:
+        if detection.label != "person":
+            return False
+        for track in self.tracks:
+            if track.label != "person" or not track.confirmed or not track.seen_this_update:
+                continue
+            if iou(track.box, detection.box) >= .65:
+                return True
+        return False
 
     def _motion(self, track: Track) -> str:
         history = list(track.history)
@@ -152,18 +217,14 @@ class LightweightTracker:
     def update(self, detections: Iterable[Detection], now: float) -> list[Track]:
         detections = list(detections)
         for track in self.tracks:
+            track.was_lost = not track.seen_this_update
             track.seen_this_update = False
         pairs: list[tuple[float, int, int]] = []
         for track_index, track in enumerate(self.tracks):
             for detection_index, detection in enumerate(detections):
-                if track.class_id != detection.class_id or track.label != detection.label:
-                    continue
-                old_x, old_y = box_center(track.box)
-                new_x, new_y = box_center(detection.box)
-                distance = ((new_x - old_x) ** 2 + (new_y - old_y) ** 2) ** .5
-                overlap = iou(track.box, detection.box)
-                if overlap >= self.min_iou or distance <= self.max_center_distance_px:
-                    pairs.append((distance / self.max_center_distance_px + (1.0 - overlap), track_index, detection_index))
+                score = self._match_score(track, detection, now)
+                if score is not None:
+                    pairs.append((score, track_index, detection_index))
         used_tracks: set[int] = set()
         used_detections: set[int] = set()
         for _, track_index, detection_index in sorted(pairs):
@@ -174,10 +235,12 @@ class LightweightTracker:
             used_detections.add(detection_index)
         for index, detection in enumerate(detections):
             if index not in used_detections:
-                self.tracks.append(self._new_track(detection, now))
+                if not self._is_duplicate_person(detection):
+                    self.tracks.append(self._new_track(detection, now))
         surviving = []
         for track in self.tracks:
-            if now - track.last_seen_at > self.lost_timeout_s:
+            timeout = self.priority_lost_timeout_s if track.priority == "HIGH" else self.lost_timeout_s
+            if now - track.last_seen_at > timeout:
                 self.expired_count += 1
             else:
                 surviving.append(track)
@@ -186,6 +249,12 @@ class LightweightTracker:
 
     def visible_motion(self, track: Track) -> str:
         return track.motion if track.seen_this_update else LOST
+
+    def tracks_for_display(self, debug: bool = False) -> list[Track]:
+        """Default display is current confirmed objects, not stale clutter."""
+        if debug:
+            return list(self.tracks)
+        return [track for track in self.tracks if track.confirmed and track.seen_this_update]
 
 
 def forward_distance(snapshot: dict | None, max_age_s: float) -> tuple[float | None, str]:
@@ -288,20 +357,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--labels", type=Path, default=DEFAULT_LABELS)
     parser.add_argument("--confidence", type=float, default=.50)
     parser.add_argument("--max-detection-fps", type=float, default=5.0)
-    parser.add_argument("--benchmark-seconds", type=float, default=60.0)
+    parser.add_argument("--benchmark-seconds", type=float, default=0.0,
+                        help="numeric duration; 0 runs until Q/Esc/Ctrl-C")
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--max-center-distance", type=float, default=120.0)
     parser.add_argument("--lost-timeout", type=float, default=1.50)
+    parser.add_argument("--priority-lost-timeout", type=float, default=2.0)
+    parser.add_argument("--confirmation-hits", type=int, default=2)
+    parser.add_argument("--confirmation-window", type=float, default=.75)
     parser.add_argument("--horizontal-dead-zone", type=float, default=35.0)
     parser.add_argument("--area-change-ratio", type=float, default=1.25)
     parser.add_argument("--ultrasonic-max-age", type=float, default=.50)
     parser.add_argument("--no-preview", action="store_true")
+    parser.add_argument("--debug-tracks", action="store_true", help="show tentative and LOST internal tracks")
     args = parser.parse_args(argv)
     if not 0 <= args.confidence <= 1 or args.max_detection_fps < 0 or args.benchmark_seconds < 0:
         parser.error("invalid confidence, FPS, or benchmark duration")
-    if args.threads < 1 or min(args.max_center_distance, args.lost_timeout, args.horizontal_dead_zone, args.ultrasonic_max_age) <= 0 or args.area_change_ratio <= 1:
+    if args.threads < 1 or args.confirmation_hits < 1 or min(args.max_center_distance, args.lost_timeout, args.priority_lost_timeout, args.confirmation_window, args.horizontal_dead_zone, args.ultrasonic_max_age) <= 0 or args.area_change_ratio <= 1:
         parser.error("tracking thresholds must be positive; area-change-ratio must exceed 1")
     return args
 
@@ -329,8 +403,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UltrasonicError as exc:
         ultrasonic_error = str(exc)
         print(f"ULTRASONIC UNAVAILABLE: {exc}\nVision/tracking will continue without distance.", flush=True)
-    tracker = LightweightTracker(max_center_distance_px=args.max_center_distance, lost_timeout_s=args.lost_timeout,
-                                 horizontal_dead_zone_px=args.horizontal_dead_zone, area_change_ratio=args.area_change_ratio)
+    tracker = LightweightTracker(max_center_distance_px=args.max_center_distance,
+                                 lost_timeout_s=args.lost_timeout,
+                                 priority_lost_timeout_s=args.priority_lost_timeout,
+                                 confirmation_hits=args.confirmation_hits,
+                                 confirmation_window_s=args.confirmation_window,
+                                 horizontal_dead_zone_px=args.horizontal_dead_zone,
+                                 area_change_ratio=args.area_change_ratio)
     stats, monitor, gate = MotionStats(), SystemMonitor(), NewestFrameGate()
     timestamps: deque[float] = deque(maxlen=30)
     last_started = next_log = 0.0
@@ -368,14 +447,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             metrics = {"inference": inference_ms, "tracking": tracking_ms, "detection_fps": fps,
                        "tracks": len(tracks), "frame_age": (frame_age + (time.monotonic() - last_started)) * 1000,
                        "ultrasonic_age": None if snapshot["age_s"] is None else snapshot["age_s"] * 1000, **system}
+            display_tracks = tracker.tracks_for_display(args.debug_tracks)
             stats.add(inference_ms, tracking_ms, system, len(tracks))
             if time.monotonic() >= next_log:
-                visual = ", ".join(f"{track.display_id} {track.position} {tracker.visible_motion(track)}" for track in tracks) or "no recognized object"
+                visual = ", ".join(f"{track.display_id} {track.position} {tracker.visible_motion(track)}" for track in display_tracks) or "no confirmed recognized object"
                 distance = "DISTANCE UNAVAILABLE" if forward is None else f"{forward:.0f} cm ({forward_state})"
                 print(f"TRACKS: {visual} | FORWARD OBSTACLE: {distance}", flush=True)
                 next_log = time.monotonic() + 1
             if not args.no_preview:
-                detector.cv2.imshow("Sense Phase 3 motion tracking prototype", draw_preview(frame.copy(), tracks, forward, forward_state, metrics, detector.cv2))
+                detector.cv2.imshow("Sense Phase 3 motion tracking prototype", draw_preview(frame.copy(), display_tracks, forward, forward_state, metrics, detector.cv2))
                 if detector.cv2.waitKey(1) & 0xFF in (ord("q"), 27): break
     except KeyboardInterrupt:
         print("Stopping on Ctrl-C.", flush=True)

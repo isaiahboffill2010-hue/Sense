@@ -3,7 +3,7 @@ import unittest
 
 from prototype_motion_tracking import (
     APPROACHING, CROSSING_LEFT, CROSSING_RIGHT, HIGH_PRIORITY, LOST, MOVING_RIGHT,
-    RECEDING, STABLE, Detection, LightweightTracker, forward_distance, priority_for,
+    RECEDING, STABLE, Detection, LightweightTracker, forward_distance, parse_args, priority_for,
 )
 
 
@@ -13,7 +13,7 @@ def detection(label="person", x=100, y=100, width=50, height=100, position="CENT
 
 class TrackingTests(unittest.TestCase):
     def tracker(self):
-        return LightweightTracker(max_center_distance_px=120, lost_timeout_s=1.0,
+        return LightweightTracker(max_center_distance_px=120, lost_timeout_s=1.0, priority_lost_timeout_s=1.0,
                                   horizontal_dead_zone_px=35, area_change_ratio=1.25)
 
     def test_same_person_nearby_detections_retains_id(self):
@@ -95,6 +95,110 @@ class TrackingTests(unittest.TestCase):
         distance, state = forward_distance({"distance_cm": None, "age_s": None, "healthy": False}, .5)
         self.assertIsNone(distance)
         self.assertEqual(state, "DISTANCE UNAVAILABLE")
+
+    def test_fast_moving_person_keeps_id(self):
+        tracker = self.tracker()
+        track = tracker.update([detection(x=80)], 0)[0]
+        tracker.update([detection(x=190)], .25)
+        track = tracker.update([detection(x=300)], .5)[0]
+        self.assertEqual(track.track_id, 1)
+        self.assertTrue(track.confirmed)
+
+    def test_one_missed_person_detection_reacquires_same_id(self):
+        tracker = self.tracker()
+        tracker.update([detection(x=100)], 0)
+        tracker.update([detection(x=150)], .25)
+        tracker.update([], .5)
+        track = tracker.update([detection(x=220)], .75)[0]
+        self.assertEqual(track.track_id, 1)
+        self.assertEqual(track.motion, STABLE)
+
+    def test_person_can_reconnect_after_several_short_misses(self):
+        tracker = LightweightTracker(lost_timeout_s=1.0, priority_lost_timeout_s=2.0)
+        tracker.update([detection(x=100)], 0)
+        tracker.update([detection(x=150)], .25)
+        tracker.update([], .5)
+        tracker.update([], .75)
+        track = tracker.update([detection(x=230)], 1.0)[0]
+        self.assertEqual(track.track_id, 1)
+
+    def test_expired_person_gets_new_id(self):
+        tracker = self.tracker()
+        tracker.update([detection()], 0)
+        tracker.update([detection(x=120)], .25)
+        tracker.update([], 1.26)
+        track = tracker.update([detection(x=120)], 1.5)[0]
+        self.assertEqual(track.track_id, 2)
+
+    def test_predicted_center_retains_moving_person(self):
+        tracker = LightweightTracker(max_center_distance_px=120, priority_center_distance_px=200)
+        tracker.update([detection(x=100)], 0)
+        tracker.update([detection(x=200)], .25)
+        track = tracker.update([detection(x=430)], .75)[0]
+        self.assertEqual(track.track_id, 1)
+
+    def test_impossible_large_jump_creates_new_person(self):
+        tracker = LightweightTracker(priority_center_distance_px=200)
+        tracker.update([detection(x=100)], 0)
+        tracker.update([detection(x=150)], .25)
+        tracks = tracker.update([detection(x=600)], .5)
+        self.assertEqual({track.track_id for track in tracks}, {1, 2})
+
+    def test_single_frame_normal_object_stays_tentative_and_hidden(self):
+        tracker = self.tracker()
+        track = tracker.update([detection("hair drier", class_id=78)], 0)[0]
+        self.assertFalse(track.confirmed)
+        self.assertEqual(tracker.tracks_for_display(), [])
+
+    def test_repeated_normal_object_becomes_confirmed(self):
+        tracker = self.tracker()
+        tracker.update([detection("chair", x=100, class_id=56)], 0)
+        track = tracker.update([detection("chair", x=105, class_id=56)], .25)[0]
+        self.assertTrue(track.confirmed)
+        self.assertEqual(tracker.tracks_for_display(), [track])
+
+    def test_confirmed_person_suppresses_overlapping_duplicate(self):
+        tracker = self.tracker()
+        tracker.update([detection(x=100)], 0)
+        tracker.update([detection(x=105)], .25)
+        tracks = tracker.update([detection(x=110), detection(x=112)], .5)
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0].track_id, 1)
+
+    def test_high_priority_confirmation_is_two_quick_hits(self):
+        tracker = self.tracker()
+        first = tracker.update([detection()], 0)[0]
+        first_was_confirmed = first.confirmed
+        second = tracker.update([detection(x=105)], .25)[0]
+        self.assertFalse(first_was_confirmed)
+        self.assertTrue(second.confirmed)
+
+    def test_two_nearby_people_remain_separate_after_confirmation(self):
+        tracker = self.tracker()
+        tracker.update([detection(x=80), detection(x=220)], 0)
+        tracks = tracker.update([detection(x=105), detection(x=195)], .25)
+        self.assertEqual({track.track_id for track in tracks}, {1, 2})
+        self.assertTrue(all(track.confirmed for track in tracks))
+
+    def test_crossing_people_are_not_intentionally_merged(self):
+        tracker = self.tracker()
+        tracker.update([detection(x=80), detection(x=260)], 0)
+        tracker.update([detection(x=140), detection(x=200)], .25)
+        tracks = tracker.update([detection(x=200), detection(x=140)], .5)
+        self.assertEqual(len(tracks), 2)
+        self.assertEqual({track.track_id for track in tracks}, {1, 2})
+
+    def test_lost_normal_track_is_hidden_without_debug(self):
+        tracker = self.tracker()
+        tracker.update([detection("chair", class_id=56)], 0)
+        tracker.update([detection("chair", x=105, class_id=56)], .25)
+        tracker.update([], .5)
+        self.assertEqual(tracker.tracks_for_display(), [])
+        self.assertEqual(len(tracker.tracks_for_display(debug=True)), 1)
+
+    def test_benchmark_cli_accepts_numeric_duration(self):
+        self.assertEqual(parse_args(["--benchmark-seconds", "60"]).benchmark_seconds, 60)
+        self.assertEqual(parse_args(["--benchmark-seconds", "0"]).benchmark_seconds, 0)
 
 
 if __name__ == "__main__":
