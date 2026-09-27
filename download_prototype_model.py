@@ -17,7 +17,7 @@ ASSETS = (
         "https://raw.githubusercontent.com/google-coral/test_data/master/"
         "ssd_mobilenet_v1_coco_quant_postprocess.tflite",
         6_938_269,
-        "020d9f0a3e8b84e13cb1db70a756ef4dd5884bfc50e77f43c7bac84e791dd9d",
+        "020d9f0a3e8b84e13cb1dbe70a756ef4dd5884bfc50e77f43c7bac84e791dd9d",
     ),
     (
         "coco_labels.txt",
