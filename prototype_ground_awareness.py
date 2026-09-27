@@ -15,7 +15,7 @@ from prototype_camera_motion import CAMERA_STABLE, CAMERA_UNCERTAIN, MotionSmoot
 from prototype_motion_tracking import LightweightTracker, forward_distance
 from prototype_vision import DEFAULT_LABELS, DEFAULT_MODEL, LiteRTDetector, NewestFrameGate, SystemMonitor, format_metric, percentile
 
-SIDEWALK, ROAD, OTHER_GROUND, UNKNOWN = "SIDEWALK", "ROAD", "OTHER_GROUND", "UNKNOWN"
+VISIBLE, UNKNOWN = "VISIBLE", "UNKNOWN"
 OPEN, OCCUPIED = "APPARENTLY OPEN", "OCCUPIED"
 POSSIBLE, NOT_OBSERVED = "POSSIBLE", "NOT OBSERVED"
 
@@ -23,8 +23,7 @@ POSSIBLE, NOT_OBSERVED = "POSSIBLE", "NOT OBSERVED"
 @dataclass(frozen=True)
 class GroundEvidence:
     visible_fraction: float
-    sidewalk_score: float
-    road_score: float
+    quality: float
     conflict: float
     boundary_strength: float
 
@@ -37,13 +36,14 @@ class GroundResult:
     evidence: GroundEvidence
     ground_mask: object | None = None
     boundary_y: int | None = None
+    space_ground_fractions: tuple[float, float, float] = (0., 0., 0.)
+    occupancy_causes: tuple[str | None, str | None, str | None] = (None, None, None)
+    transition_samples: tuple[bool, ...] = ()
 
 
 def classify_ground(evidence: GroundEvidence) -> str:
-    if evidence.visible_fraction < .35 or evidence.conflict > .30: return UNKNOWN
-    strongest, other = max(evidence.sidewalk_score, evidence.road_score), min(evidence.sidewalk_score, evidence.road_score)
-    if strongest >= .70 and strongest - other >= .15: return SIDEWALK if evidence.sidewalk_score > evidence.road_score else ROAD
-    return OTHER_GROUND if evidence.visible_fraction >= .60 else UNKNOWN
+    """VISIBLE is lower-image evidence, never a surface semantic or safety claim."""
+    return VISIBLE if evidence.visible_fraction >= .60 and evidence.quality >= .40 and evidence.conflict <= .30 else UNKNOWN
 
 
 def ground_analysis_reliable(camera_motion) -> bool:
@@ -51,18 +51,24 @@ def ground_analysis_reliable(camera_motion) -> bool:
     return camera_motion.state == CAMERA_STABLE
 
 
-def spaces_from_fractions(fractions: Iterable[float], tracks: Iterable[object], width: int, height: int) -> tuple[str, str, str]:
-    output=[]
+def space_details(fractions: Iterable[float], tracks: Iterable[object], width: int, height: int) -> tuple[tuple[str, str, str], tuple[str | None, str | None, str | None]]:
+    output=[]; causes=[]
     for index, ground_fraction in enumerate(fractions):
         left, right = index * width // 3, (index + 1) * width // 3
-        occupied=False
+        cause=None
         for track in tracks:
             if not track.confirmed or not track.seen_this_update: continue
             box_left, _, box_right, box_bottom=track.box
             overlap=max(0, min(right,box_right)-max(left,box_left))
-            if overlap and box_bottom >= height * .55: occupied=True; break
-        output.append(OCCUPIED if occupied else OPEN if ground_fraction >= .55 else UNKNOWN)
-    return tuple(output)
+            # A sliver of a large box must not block a neighbouring lane.
+            if overlap >= max(12, .20 * (right-left)) and box_bottom >= height * .65:
+                cause=getattr(track,"display_id",getattr(track,"label","confirmed object")); break
+        output.append(OCCUPIED if cause else OPEN if ground_fraction >= .55 else UNKNOWN); causes.append(cause)
+    return tuple(output),tuple(causes)
+
+
+def spaces_from_fractions(fractions: Iterable[float], tracks: Iterable[object], width: int, height: int) -> tuple[str, str, str]:
+    return space_details(fractions, tracks, width, height)[0]
 
 
 def occupancy_for_spaces(mask, tracks: Iterable[object], np) -> tuple[str, str, str]:
@@ -70,7 +76,7 @@ def occupancy_for_spaces(mask, tracks: Iterable[object], np) -> tuple[str, str, 
     for index in range(3):
         left, right = index * width // 3, (index + 1) * width // 3
         fractions.append(float(np.mean(mask[height//2:, left:right] > 0)))
-    return spaces_from_fractions(fractions, tracks, width, height)
+    return space_details(fractions, tracks, width, height)
 
 
 class TransitionHistory:
@@ -103,16 +109,19 @@ class GroundAnalyzer:
                 if abs(y2-y1)<=5 and abs(x2-x1)>=55 and 25<=y1<=105: horizontal.append((abs(x2-x1),int((y1+y2)/2)))
             if horizontal:
                 length,boundary_y=max(horizontal); strength=min(1.,length/160); boundary_y=top+round(boundary_y*roi.shape[0]/120)
-        # Heuristic labels are deliberately strict and commonly return OTHER/UNKNOWN.
-        road_score=max(0.,min(1., .55*visible + .25*(1-mean_sat) + .20*(1-texture)))
-        sidewalk_score=max(0.,min(1., .45*visible + .35*texture + .20*strength))
-        evidence=GroundEvidence(visible,sidewalk_score,road_score,abs(sidewalk_score-road_score)<.15,strength)
+        quality=max(0.,min(1., .70*visible + .30*(1-texture)))
+        conflict=max(0.,min(1., float(np.std(saturation))/64.))
+        evidence=GroundEvidence(visible,quality,conflict,strength)
         reliable=ground_analysis_reliable(camera_motion)
-        transition=history.update(strength >= .55 and visible >= .35,reliable)
+        candidate=strength >= .55 and visible >= .60 and quality >= .55 and conflict <= .30
+        transition=history.update(candidate,reliable)
         category=classify_ground(evidence) if reliable else UNKNOWN
         full_mask=np.zeros((height,width),dtype=np.uint8); full_mask[top:]=cv2.resize(ground,(width,height-top),interpolation=cv2.INTER_NEAREST)
-        spaces=occupancy_for_spaces(full_mask,tracks,np) if reliable else (UNKNOWN,UNKNOWN,UNKNOWN)
-        return GroundResult(category,spaces,transition,evidence,full_mask,boundary_y)
+        if reliable:
+            spaces,causes=occupancy_for_spaces(full_mask,tracks,np)
+            fractions=tuple(float(np.mean(full_mask[height//2:, index*width//3:(index+1)*width//3] > 0)) for index in range(3))
+        else: spaces,causes,fractions=(UNKNOWN,UNKNOWN,UNKNOWN),(None,None,None),(0.,0.,0.)
+        return GroundResult(category,spaces,transition,evidence,full_mask,boundary_y,fractions,causes,tuple(history.values))
 
 
 @dataclass
@@ -131,6 +140,7 @@ def parse_args(argv:Sequence[str]|None=None):
 
 
 def concise(result,camera): return f"GROUND: {result.category} | WALKING SPACE: LEFT {result.spaces[0]} | CENTER {result.spaces[1]} | RIGHT {result.spaces[2]} | GROUND TRANSITION: {result.transition} | CAMERA: {camera.state}"
+def debug_details(result,camera): return f"GROUND DEBUG: visible={result.evidence.visible_fraction:.2f} quality={result.evidence.quality:.2f} conflict={result.evidence.conflict:.2f} spaces={result.space_ground_fractions} occupied_by={result.occupancy_causes} transition_samples={result.transition_samples} camera_suppressed={not ground_analysis_reliable(camera)}"
 def draw(frame,result,tracks,camera,cv2):
     h,w=frame.shape[:2]
     if result.ground_mask is not None:
@@ -156,7 +166,7 @@ def main(argv:Sequence[str]|None=None)->int:
     try:
         try: sensor=UltrasonicSensor().open(); ultrasonic=UltrasonicMonitor(sensor); ultrasonic.start()
         except UltrasonicError as exc: ultrasonic_error=str(exc); print(f"ULTRASONIC UNAVAILABLE: {exc}",flush=True)
-        tracker=LightweightTracker(); smoother=MotionSmoother(); gate=NewestFrameGate(); monitor=SystemMonitor(); history=TransitionHistory(); analyzer=GroundAnalyzer(detector.cv2,detector.np); estimator=SparseCameraMotionEstimator(detector.cv2,detector.np); result=GroundResult(UNKNOWN,(UNKNOWN,UNKNOWN,UNKNOWN),UNKNOWN,GroundEvidence(0,0,0,0,0)); last_detect=last_ground=next_log=0.
+        tracker=LightweightTracker(); smoother=MotionSmoother(); gate=NewestFrameGate(); monitor=SystemMonitor(); history=TransitionHistory(); analyzer=GroundAnalyzer(detector.cv2,detector.np); estimator=SparseCameraMotionEstimator(detector.cv2,detector.np); result=GroundResult(UNKNOWN,(UNKNOWN,UNKNOWN,UNKNOWN),UNKNOWN,GroundEvidence(0,0,0,0)); last_detect=last_ground=next_log=0.
         print("SENSE PHASE 6 GROUND PROTOTYPE | Gemini/cloud/audio/navigation: DISABLED",flush=True)
         camera=Camera(resolution=(args.camera_width,args.camera_height),pixel_format="RGB888").open(); reader=CameraReader(camera); reader.start()
         while True:
@@ -172,7 +182,10 @@ def main(argv:Sequence[str]|None=None)->int:
                 for key,target in (("cpu",stats.cpu),("rss",stats.rss),("temp",stats.temp)):
                     if sample.get(key) is not None: target.append(float(sample[key]))
                 snapshot=ultrasonic.snapshot() if ultrasonic else {"distance_cm":None,"age_s":None,"healthy":False,"error":ultrasonic_error}; forward,state=forward_distance(snapshot,.5)
-                if now>=next_log: print(concise(result,camera_motion)+(f" | FORWARD OBSTACLE: {forward:.0f} cm ({state})" if forward is not None else " | FORWARD OBSTACLE: DISTANCE UNAVAILABLE"),flush=True); next_log=now+1
+                if now>=next_log:
+                    print(concise(result,camera_motion)+(f" | FORWARD OBSTACLE: {forward:.0f} cm ({state})" if forward is not None else " | FORWARD OBSTACLE: DISTANCE UNAVAILABLE"),flush=True)
+                    if args.debug_ground: print(debug_details(result,camera_motion),flush=True)
+                    next_log=now+1
             if not args.no_preview:
                 detector.cv2.imshow("Sense Phase 6 ground prototype",draw(frame.copy(),result,tracker.tracks_for_display(args.debug_ground),camera_motion,detector.cv2))
                 if detector.cv2.waitKey(1)&0xFF in (ord('q'),27): break
