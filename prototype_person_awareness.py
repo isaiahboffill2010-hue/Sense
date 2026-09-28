@@ -65,7 +65,7 @@ def group_motion(items,camera):
 def format_top(items):return [f"{x.track.display_id} | {x.level} | {x.transition} | {x.approach}" for x in items[:3]]
 def console(items,camera):return f"PEOPLE: {len(items)} tracked | TOP: "+("; ".join(format_top(items)) if items else "none")+(" | MOTION: UNCERTAIN" if camera.state==CAMERA_UNCERTAIN else "")
 def parse_args(argv:Sequence[str]|None=None):
- p=argparse.ArgumentParser();p.add_argument("--model",type=Path,default=DEFAULT_MODEL);p.add_argument("--labels",type=Path,default=DEFAULT_LABELS);p.add_argument("--confidence",type=float,default=.5);p.add_argument("--max-detection-fps",type=float,default=5);p.add_argument("--threads",type=int,default=2);p.add_argument("--camera-width",type=int,default=640);p.add_argument("--camera-height",type=int,default=480);p.add_argument("--benchmark-seconds",type=float,default=0);p.add_argument("--no-preview",action="store_true");p.add_argument("--debug-people",action="store_true");a=p.parse_args(argv)
+ p=argparse.ArgumentParser();p.add_argument("--model",type=Path,default=DEFAULT_MODEL);p.add_argument("--labels",type=Path,default=DEFAULT_LABELS);p.add_argument("--confidence",type=float,default=.5);p.add_argument("--max-detection-fps",type=float,default=5);p.add_argument("--threads",type=int,default=2);p.add_argument("--camera-width",type=int,default=640);p.add_argument("--camera-height",type=int,default=480);p.add_argument("--benchmark-seconds",type=float,default=0);p.add_argument("--no-preview",action="store_true");p.add_argument("--debug-people",action="store_true");p.add_argument("--event-manager",action="store_true");p.add_argument("--debug-events",action="store_true");a=p.parse_args(argv)
  if a.benchmark_seconds<0:p.error("invalid benchmark duration")
  return a
 def main(argv=None):
@@ -75,7 +75,10 @@ def main(argv=None):
   from hardware.camera import Camera,CameraError,CameraReader
   detector=LiteRTDetector(a.model,a.labels,a.threads)
  except Exception as e:print(f"PHASE 7.5 STARTUP FAILED: {type(e).__name__}: {e}",file=sys.stderr);return 2
- camera=reader=None;started=time.monotonic();last=next_log=0.;engine=PersonEngine();tracker=LightweightTracker();smoother=MotionSmoother();gate=NewestFrameGate()
+ camera=reader=None;started=time.monotonic();last=next_log=0.;engine=PersonEngine();tracker=LightweightTracker();smoother=MotionSmoother();gate=NewestFrameGate();manager=None
+ if a.event_manager:
+  from prototype_event_manager import EventManager
+  manager=EventManager()
  print("SENSE PHASE 7.5 PERSON PROTOTYPE | Gemini/cloud/audio/navigation: DISABLED",flush=True)
  try:
   camera=Camera(resolution=(a.camera_width,a.camera_height),pixel_format="RGB888").open();reader=CameraReader(camera);reader.start();estimator=SparseCameraMotionEstimator(detector.cv2,detector.np)
@@ -86,7 +89,11 @@ def main(argv=None):
    frame,_=reader.latest()
    if frame is None or not gate.accept(id(frame)):time.sleep(.002);continue
    last=now;detections,_=detector.detect(frame,a.confidence);motion=smoother.update(estimator.update(frame,detections)[0]);tracker.update(detections,time.monotonic());items=engine.observe(tracker.tracks_for_display(),motion,(frame.shape[1],frame.shape[0]))
-   if now>=next_log:
+   if manager is not None:
+    from prototype_event_manager import person_events
+    for action,event,reason in manager.process(person_events(items,now),now):
+     if action=="EMIT" or a.debug_events:print(f"{action} [{event.priority}] {event.entity_type} #{event.entity_id} {event.event_type} {event.zone}: {reason}",flush=True)
+   if now>=next_log and manager is None:
     print(console(items,motion),flush=True)
     if a.debug_people:
      for item in items:print(f"DEBUG {item.track.display_id}: box={item.track.box} zone={item.track.position} motion={item.motion} approach={item.approach} reasons={item.reasons} ahead={item.ahead} score={item.score} event={item.event}",flush=True)
