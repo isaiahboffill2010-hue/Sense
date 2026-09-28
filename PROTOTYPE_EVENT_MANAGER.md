@@ -2,7 +2,7 @@
 
 `Event` is a structured future-speech payload: source, type, entity/id, zone, state, priority, reasons, reliability, TTL-derived active state, and metadata. The manager never performs perception. It supports person adapters now, vehicle/ultrasonic/walking-space source namespaces through the same schema.
 
-Priority is LOW/MEDIUM/HIGH/CRITICAL. Only independent ultrasonic close states should ever use stronger priority; visual approach remains HIGH. Deduplication keys include source, entity type/id, and event type. Default cooldowns are 8–20 seconds by event type, escalation/change bypasses cooldown, active records expire after type TTL plus one-second loss grace, and the output budget is two events per processing cycle; lower events drop rather than queue stale information.
+Priority is LOW/MEDIUM/HIGH/CRITICAL. Only independent ultrasonic close states should ever use stronger priority; visual approach remains HIGH. Deduplication keys include source, entity type/id, and event type. Cooldowns only annotate duplicate timing: an unchanged active event is suppressed even after its cooldown expires. Escalation/change bypasses suppression; active records expire after type TTL plus one-second loss grace, which rearms a later return. The output budget is two events per processing cycle; lower events drop rather than queue stale information.
 
 ```bash
 cd ~/Sense

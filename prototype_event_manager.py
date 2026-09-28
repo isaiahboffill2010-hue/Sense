@@ -26,7 +26,7 @@ class EventManager:
     record.last_seen=now
     if RANK[event.priority]>RANK[record.event.priority] or event.state!=record.event.state: candidates.append((event,"meaningful escalation/change"))
     elif now-record.last_emit<cool:actions.append(("SUPPRESS",event,"duplicate active event"))
-    else:candidates.append((event,"cooldown elapsed"))
+    else:actions.append(("SUPPRESS",event,"cooldown elapsed but state unchanged"))
    else:candidates.append((event,"new event"))
   for key,record in list(self.active.items()):
    if now-record.last_seen>TTL.get(record.event.event_type,3.)+LOST_GRACE:self.active.pop(key);actions.append(("ENDED",record.event,"expired"))

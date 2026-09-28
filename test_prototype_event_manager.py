@@ -4,6 +4,10 @@ def e(i=1,typ="PERSON_AHEAD",priority=MEDIUM,t=0,source="person_awareness"):retu
 class T(unittest.TestCase):
  def test_new_duplicate_distinct(self):
   m=EventManager();self.assertEqual(m.process([e()],0)[0][0],"EMIT");self.assertEqual(m.process([e()],1)[0][0],"SUPPRESS");self.assertEqual(m.process([e(2)],1)[0][0],"EMIT")
+ def test_continuous_active_event_never_reemits_after_cooldown(self):
+  m=EventManager();self.assertEqual(m.process([e()],0)[0][0],"EMIT");action=m.process([e()],100)[0];self.assertEqual(action[0],"SUPPRESS");self.assertIn("state unchanged",action[2])
+ def test_clear_and_return_rearms(self):
+  m=EventManager();m.process([e()],0);m.process([],10);self.assertEqual(m.process([e()],11)[0][0],"EMIT")
  def test_escalation_budget(self):
   m=EventManager(1);m.process([e()],0);self.assertEqual(m.process([e(1,"POSSIBLE_APPROACH",HIGH)],1)[0][0],"EMIT");a=m.process([e(3),e(4),e(5)],2);self.assertEqual(sum(x[0]=="EMIT" for x in a),1)
  def test_ttl_uncertainty_payload(self):
