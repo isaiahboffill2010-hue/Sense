@@ -2,6 +2,7 @@
 """Phase 7.5 local person-awareness logic; observations only."""
 from __future__ import annotations
 import argparse, statistics, sys, time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -75,7 +76,8 @@ def main(argv=None):
   from hardware.camera import Camera,CameraError,CameraReader
   detector=LiteRTDetector(a.model,a.labels,a.threads)
  except Exception as e:print(f"PHASE 7.5 STARTUP FAILED: {type(e).__name__}: {e}",file=sys.stderr);return 2
- camera=reader=None;started=time.monotonic();last=next_log=0.;engine=PersonEngine();tracker=LightweightTracker();smoother=MotionSmoother();gate=NewestFrameGate();manager=None
+ camera=reader=None;controller=None;executor=None;future=None;started=time.monotonic();last=next_log=0.;engine=PersonEngine();tracker=LightweightTracker();smoother=MotionSmoother();gate=NewestFrameGate();manager=None
+ preview_frames=ai_frames=0;inference_ms=[];motion_ms=[];tracking_ms=[];people_ms=[];event_ms=[];latest_items=[];latest_motion=None
  speech=None
  if a.event_manager or a.speech or a.speech_dry_run:
   from prototype_event_manager import EventManager
@@ -92,36 +94,60 @@ def main(argv=None):
      provider=GeminiTTSProvider(model=config.GEMINI_TTS_MODEL,voice=config.GEMINI_TTS_VOICE,style=config.GEMINI_TTS_STYLE,timeout_s=config.GEMINI_TTS_TIMEOUT_S,volume_boost=config.GEMINI_TTS_VOLUME_BOOST,peak_ceiling=config.GEMINI_TTS_PEAK_CEILING).open()
      controller=SpeechController(GeminiSpeechPlayer(provider,fallback));controller.start();player=controller
     except Exception as exc:print(f"SPEECH SETUP FAILED: {type(exc).__name__}: {exc}",flush=True)
-   speech=SpeechManager(player,dry_run=a.speech_dry_run)
- print("SENSE PHASE 7.5 PERSON PROTOTYPE | Gemini/cloud/audio/navigation: DISABLED",flush=True)
+   speech=SpeechManager(player,dry_run=a.speech_dry_run);speech.start()
+ print("Sense Live Person/Event Prototype",flush=True)
+ print(f"Speech: {'ENABLED (Despina)' if a.speech else 'DRY RUN' if a.speech_dry_run else 'DISABLED'}",flush=True)
+ print("Gemini Vision: DISABLED\nNavigation: DISABLED",flush=True)
  try:
   camera=Camera(resolution=(a.camera_width,a.camera_height),pixel_format="RGB888").open();reader=CameraReader(camera);reader.start();estimator=SparseCameraMotionEstimator(detector.cv2,detector.np)
-  while True:
-   now=time.monotonic()
-   if a.benchmark_seconds and now-started>=a.benchmark_seconds:break
-   if now-last<1/a.max_detection_fps:time.sleep(.002);continue
-   frame,_=reader.latest()
-   if frame is None or not gate.accept(id(frame)):time.sleep(.002);continue
-   last=now;detections,_=detector.detect(frame,a.confidence);motion=smoother.update(estimator.update(frame,detections)[0]);tracker.update(detections,time.monotonic());items=engine.observe(tracker.tracks_for_display(),motion,(frame.shape[1],frame.shape[0]))
+  # Exactly one worker owns SSD, motion, tracking, and events.  The main loop
+  # only consumes CameraReader's latest-frame slot for responsive preview.
+  executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix="sense-ai")
+  def infer(inference_frame,event_time):
+   began=time.monotonic();detections,_=detector.detect(inference_frame,a.confidence);inference_ms.append((time.monotonic()-began)*1000)
+   began=time.monotonic();motion=smoother.update(estimator.update(inference_frame,detections)[0]);motion_ms.append((time.monotonic()-began)*1000)
+   began=time.monotonic();tracker.update(detections,time.monotonic());tracking_ms.append((time.monotonic()-began)*1000)
+   began=time.monotonic();items=engine.observe(tracker.tracks_for_display(),motion,(inference_frame.shape[1],inference_frame.shape[0]));people_ms.append((time.monotonic()-began)*1000)
    if manager is not None:
     from prototype_event_manager import person_events
-    for action,event,reason in manager.process(person_events(items,now),now):
-     if speech is not None and speech.submit(action,event,now) and a.debug_speech:print(f'SPEECH QUEUED: "{speech.pending.text}"',flush=True)
+    began=time.monotonic();event_now=time.monotonic()
+    for action,event,reason in manager.process(person_events(items,event_now),event_now):
+     if speech is not None and speech.submit(action,event,event_now) and a.debug_speech:print(f'SPEECH QUEUED: "{event.event_type}"',flush=True)
      if action=="EMIT" or a.debug_events:print(f"{action} [{event.priority}] {event.entity_type} #{event.entity_id} {event.event_type} {event.zone}: {reason}",flush=True)
-   if speech is not None:speech.process(now)
-   if now>=next_log and manager is None:
-    print(console(items,motion),flush=True)
-    if a.debug_people:
-     for item in items:print(f"DEBUG {item.track.display_id}: box={item.track.box} zone={item.track.position} motion={item.motion} approach={item.approach} reasons={item.reasons} ahead={item.ahead} score={item.score} event={item.event}",flush=True)
-    next_log=now+1
-   if not a.no_preview:
-    for item in items:
-     l,t,r,b=item.track.box;detector.cv2.rectangle(frame,(l,t),(r,b),(0,220,220),2);detector.cv2.putText(frame,f"{item.track.display_id} {item.level} {item.approach}",(l,max(18,t-6)),detector.cv2.FONT_HERSHEY_SIMPLEX,.42,(0,220,220),1)
-    detector.cv2.imshow("Sense Phase 7.5 person prototype",frame)
+    event_ms.append((time.monotonic()-began)*1000)
+   return items,motion
+  while True:
+   now=time.monotonic();frame,_=reader.latest()
+   if a.benchmark_seconds and now-started>=a.benchmark_seconds:break
+   if not a.no_preview and frame is not None:
+    preview_frames+=1
+    display_frame=frame.copy()
+    for item in latest_items:
+     l,t,r,b=item.track.box;detector.cv2.rectangle(display_frame,(l,t),(r,b),(0,220,220),2);detector.cv2.putText(display_frame,f"{item.track.display_id} {item.level} {item.approach}",(l,max(18,t-6)),detector.cv2.FONT_HERSHEY_SIMPLEX,.42,(0,220,220),1)
+    detector.cv2.imshow("Sense Live Person/Event Prototype",display_frame)
     if detector.cv2.waitKey(1)&0xFF in (ord('q'),27):break
+   if future is not None and future.done():
+    latest_items,latest_motion=future.result();future=None;ai_frames+=1
+   if future is None and frame is not None and now-last>=1/a.max_detection_fps and gate.accept(id(frame)):
+    last=now;future=executor.submit(infer,frame.copy(),now)
+   if now>=next_log:
+    print(console(latest_items,latest_motion) if latest_motion is not None else "PEOPLE: waiting for AI",flush=True)
+    if a.debug_people:
+     for item in latest_items:print(f"DEBUG {item.track.display_id}: box={item.track.box} zone={item.track.position} motion={item.motion} approach={item.approach} reasons={item.reasons} ahead={item.ahead} score={item.score} event={item.event}",flush=True)
+    next_log=now+1
  except KeyboardInterrupt:pass
  except CameraError as e:print(f"CAMERA FAILED: {e}",file=sys.stderr);return 3
  finally:
+  elapsed=max(.001,time.monotonic()-started)
+  if a.benchmark_seconds:
+   mean=lambda values:statistics.fmean(values) if values else 0.0
+   capture=reader.snapshot().get("fps") if reader else None
+   print(f"BENCHMARK capture FPS: {capture if capture is not None else 0.0:.1f} | preview FPS: {preview_frames/elapsed:.1f} | AI FPS: {ai_frames/elapsed:.1f} | inference: {mean(inference_ms):.1f}ms | motion: {mean(motion_ms):.1f}ms | tracking: {mean(tracking_ms):.1f}ms | people: {mean(people_ms):.1f}ms | events: {mean(event_ms):.1f}ms",flush=True)
+   print(f"TRACKS created={tracker.created_count} expired={tracker.expired_count}",flush=True)
+   if speech is not None:print(f"SPEECH {speech.stats}",flush=True)
+  if executor:executor.shutdown(wait=True,cancel_futures=False)
+  if speech:speech.stop()
+  if controller:controller.stop()
   if reader:reader.stop()
   if camera:camera.close()
   if not a.no_preview:detector.cv2.destroyAllWindows()

@@ -105,6 +105,7 @@ class LightweightTracker:
         self._next_id: defaultdict[str, int] = defaultdict(int)
         self.created_count = 0
         self.expired_count = 0
+        self.reacquired_count = 0
 
     def _new_track(self, detection: Detection, now: float) -> Track:
         self._next_id[detection.label] += 1
@@ -185,6 +186,31 @@ class LightweightTracker:
                 return True
         return False
 
+    def _reacquire_person(self, detection: Detection, now: float, used_tracks: set[int]) -> int | None:
+        """Return one unambiguous, recently-lost confirmed person candidate.
+
+        This is intentionally narrower than normal association: it is only a
+        recovery path after a detector miss, requires compatible box scale plus
+        either overlap or close predicted position, and refuses ambiguity.
+        """
+        if detection.label != "person":
+            return None
+        candidates = []
+        detected_x, detected_y = box_center(detection.box)
+        for index, track in enumerate(self.tracks):
+            if index in used_tracks or track.label != "person" or not track.confirmed or not track.was_lost:
+                continue
+            if now - track.last_seen_at > self.priority_lost_timeout_s:
+                continue
+            old_area, new_area = box_area(track.box), box_area(detection.box)
+            ratio = min(old_area, new_area) / max(old_area, new_area) if old_area and new_area else 0.0
+            predicted_x, predicted_y = self._predicted_center(track, now)
+            predicted_distance = ((detected_x-predicted_x)**2+(detected_y-predicted_y)**2)**.5
+            overlap = iou(track.box, detection.box)
+            if ratio >= .20 and (overlap >= .03 or predicted_distance <= self.max_center_distance_px):
+                candidates.append(index)
+        return candidates[0] if len(candidates) == 1 else None
+
     def _motion(self, track: Track) -> str:
         history = list(track.history)
         if len(history) < 3:
@@ -235,7 +261,12 @@ class LightweightTracker:
             used_detections.add(detection_index)
         for index, detection in enumerate(detections):
             if index not in used_detections:
-                if not self._is_duplicate_person(detection):
+                reacquire_index = self._reacquire_person(detection, now, used_tracks)
+                if reacquire_index is not None:
+                    self._update_track(self.tracks[reacquire_index], detection, now)
+                    used_tracks.add(reacquire_index)
+                    self.reacquired_count += 1
+                elif not self._is_duplicate_person(detection):
                     self.tracks.append(self._new_track(detection, now))
         surviving = []
         for track in self.tracks:

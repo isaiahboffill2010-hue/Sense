@@ -113,6 +113,23 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(track.track_id, 1)
         self.assertEqual(track.motion, STABLE)
 
+    def test_short_miss_with_large_box_change_reacquires_confirmed_person(self):
+        tracker = self.tracker()
+        tracker.update([detection(x=100, width=60, height=100)], 0)
+        tracker.update([detection(x=110, width=60, height=100)], .25)
+        tracker.update([], .5)
+        track = tracker.update([detection(x=120, width=25, height=55)], .75)[0]
+        self.assertEqual(track.track_id, 1)
+        self.assertEqual(tracker.reacquired_count, 1)
+
+    def test_ambiguous_lost_people_do_not_reclaim_new_detection(self):
+        tracker = self.tracker()
+        tracker.update([detection(x=100), detection(x=160)], 0)
+        tracker.update([detection(x=105), detection(x=165)], .25)
+        tracker.update([], .5)
+        tracks = tracker.update([detection(x=135, width=10, height=100)], .75)
+        self.assertIn(3, {track.track_id for track in tracks})
+
     def test_person_can_reconnect_after_several_short_misses(self):
         tracker = LightweightTracker(lost_timeout_s=1.0, priority_lost_timeout_s=2.0)
         tracker.update([detection(x=100)], 0)
