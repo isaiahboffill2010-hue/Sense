@@ -22,7 +22,7 @@ class T(unittest.TestCase):
  def test_ahead(self):self.assertTrue(PersonEngine().observe([person("CENTER")],cam())[0].ahead)
  def test_event_group_top(self):
   e=PersonEngine();x=person(centers=[0,30]);self.assertEqual(e.observe([x],cam())[0].event,"NEW");self.assertEqual(e.observe([x],cam())[0].event,"ONGOING");items=e.observe([person(i=1,centers=[0,30]),person(i=2,centers=[0,30]),person(i=3),person(i=4)],cam());self.assertEqual(len(format_top(items)),3);self.assertIn("moving right",group_motion(items,cam()))
- def test_forbidden_cli(self):self.assertNotIn("SAFE TO CROSS",console([],cam()));self.assertEqual(parse_args(["--benchmark-seconds","60"]).benchmark_seconds,60)
+ def test_forbidden_cli(self):self.assertNotIn("SAFE TO CROSS",console([],cam()));self.assertEqual(parse_args(["--benchmark-seconds","60"]).benchmark_seconds,60);self.assertTrue(parse_args(["--debug-tracking"]).debug_tracking)
  def test_runtime_wiring_exists(self):
   import prototype_person_awareness as module
-  source=inspect.getsource(module.main);self.assertIn("CameraReader",source);self.assertIn("LiteRTDetector",source);self.assertIn("LightweightTracker",source);self.assertIn("SparseCameraMotionEstimator",source);self.assertIn("while True",source)
+  source=inspect.getsource(module.main);self.assertIn("CameraReader",source);self.assertIn("LiteRTDetector",source);self.assertIn("LightweightTracker",source);self.assertIn("SparseCameraMotionEstimator",source);self.assertIn("while True",source);self.assertEqual(source.count("tracker.update("),1)

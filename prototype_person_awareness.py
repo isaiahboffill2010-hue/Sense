@@ -66,7 +66,7 @@ def group_motion(items,camera):
 def format_top(items):return [f"{x.track.display_id} | {x.level} | {x.transition} | {x.approach}" for x in items[:3]]
 def console(items,camera):return f"PEOPLE: {len(items)} tracked | TOP: "+("; ".join(format_top(items)) if items else "none")+(" | MOTION: UNCERTAIN" if camera.state==CAMERA_UNCERTAIN else "")
 def parse_args(argv:Sequence[str]|None=None):
- p=argparse.ArgumentParser();p.add_argument("--model",type=Path,default=DEFAULT_MODEL);p.add_argument("--labels",type=Path,default=DEFAULT_LABELS);p.add_argument("--confidence",type=float,default=.5);p.add_argument("--max-detection-fps",type=float,default=5);p.add_argument("--threads",type=int,default=2);p.add_argument("--camera-width",type=int,default=640);p.add_argument("--camera-height",type=int,default=480);p.add_argument("--benchmark-seconds",type=float,default=0);p.add_argument("--no-preview",action="store_true");p.add_argument("--debug-people",action="store_true");p.add_argument("--event-manager",action="store_true");p.add_argument("--debug-events",action="store_true");p.add_argument("--speech",action="store_true");p.add_argument("--speech-dry-run",action="store_true");p.add_argument("--debug-speech",action="store_true");a=p.parse_args(argv)
+ p=argparse.ArgumentParser();p.add_argument("--model",type=Path,default=DEFAULT_MODEL);p.add_argument("--labels",type=Path,default=DEFAULT_LABELS);p.add_argument("--confidence",type=float,default=.5);p.add_argument("--max-detection-fps",type=float,default=5);p.add_argument("--threads",type=int,default=2);p.add_argument("--camera-width",type=int,default=640);p.add_argument("--camera-height",type=int,default=480);p.add_argument("--benchmark-seconds",type=float,default=0);p.add_argument("--no-preview",action="store_true");p.add_argument("--debug-people",action="store_true");p.add_argument("--debug-tracking",action="store_true");p.add_argument("--event-manager",action="store_true");p.add_argument("--debug-events",action="store_true");p.add_argument("--speech",action="store_true");p.add_argument("--speech-dry-run",action="store_true");p.add_argument("--debug-speech",action="store_true");a=p.parse_args(argv)
  if a.benchmark_seconds<0:p.error("invalid benchmark duration")
  return a
 def main(argv=None):
@@ -107,6 +107,9 @@ def main(argv=None):
    began=time.monotonic();detections,_=detector.detect(inference_frame,a.confidence);inference_ms.append((time.monotonic()-began)*1000)
    began=time.monotonic();motion=smoother.update(estimator.update(inference_frame,detections)[0]);motion_ms.append((time.monotonic()-began)*1000)
    began=time.monotonic();tracker.update(detections,time.monotonic());tracking_ms.append((time.monotonic()-began)*1000)
+   if a.debug_tracking:
+    debug=tracker.last_update_debug
+    print(f"TRACK DEBUG raw={debug['raw_person_detections']} persons={debug['person_detections']} tracks_before={debug['tracks_before']} matched={debug['matched']} reacquired={debug['reacquired']} new={debug['new']} expired={debug['expired']} unmatched_tracks={debug['unmatched_tracks']}",flush=True)
    began=time.monotonic();items=engine.observe(tracker.tracks_for_display(),motion,(inference_frame.shape[1],inference_frame.shape[0]));people_ms.append((time.monotonic()-began)*1000)
    if manager is not None:
     from prototype_event_manager import person_events
@@ -144,6 +147,9 @@ def main(argv=None):
    capture=reader.snapshot().get("fps") if reader else None
    print(f"BENCHMARK capture FPS: {capture if capture is not None else 0.0:.1f} | preview FPS: {preview_frames/elapsed:.1f} | AI FPS: {ai_frames/elapsed:.1f} | inference: {mean(inference_ms):.1f}ms | motion: {mean(motion_ms):.1f}ms | tracking: {mean(tracking_ms):.1f}ms | people: {mean(people_ms):.1f}ms | events: {mean(event_ms):.1f}ms",flush=True)
    print(f"TRACKS created={tracker.created_count} expired={tracker.expired_count}",flush=True)
+   continuity=tracker.continuity_summary()
+   print(f"PERSON DETECTION CONTINUITY AI cycles={continuity['cycles']} | 0={continuity['zero']} ({continuity['zero_percent']:.1f}%) | 1={continuity['one']} ({continuity['one_percent']:.1f}%) | 2+={continuity['two_plus']} ({continuity['two_plus_percent']:.1f}%) | longest 0/1/2+={continuity['longest_zero']}/{continuity['longest_one']}/{continuity['longest_two_plus']}",flush=True)
+   print(f"PERSON TRACKING created={tracker.created_count} expired={tracker.expired_count} reacquired={tracker.reacquired_count} duplicate detections suppressed={continuity['duplicates']}",flush=True)
    if speech is not None:print(f"SPEECH {speech.stats}",flush=True)
   if executor:executor.shutdown(wait=True,cancel_futures=False)
   if speech:speech.stop()

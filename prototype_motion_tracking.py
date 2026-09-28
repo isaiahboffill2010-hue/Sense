@@ -106,6 +106,13 @@ class LightweightTracker:
         self.created_count = 0
         self.expired_count = 0
         self.reacquired_count = 0
+        self.duplicate_person_detections = 0
+        self.person_cycles = 0
+        self.person_cycle_counts = defaultdict(int)
+        self.person_longest_runs = defaultdict(int)
+        self._person_run = None
+        self._person_run_length = 0
+        self.last_update_debug = {}
 
     def _new_track(self, detection: Detection, now: float) -> Track:
         self._next_id[detection.label] += 1
@@ -186,6 +193,28 @@ class LightweightTracker:
                 return True
         return False
 
+    def _filter_duplicate_person_detections(self, detections: list[Detection]) -> list[Detection]:
+        """Keep only the strongest near-identical person box per AI result."""
+        kept = []
+        for detection in sorted(detections, key=lambda item: item.confidence, reverse=True):
+            if detection.label == "person" and any(other.label == "person" and iou(detection.box, other.box) >= .75 for other in kept):
+                self.duplicate_person_detections += 1
+                continue
+            kept.append(detection)
+        return kept
+
+    def _record_person_cycle(self, raw_count: int, filtered_count: int) -> None:
+        bucket = "zero" if filtered_count == 0 else "one" if filtered_count == 1 else "two_plus"
+        self.person_cycles += 1
+        self.person_cycle_counts[bucket] += 1
+        if bucket == self._person_run:
+            self._person_run_length += 1
+        else:
+            self._person_run, self._person_run_length = bucket, 1
+        self.person_longest_runs[bucket] = max(self.person_longest_runs[bucket], self._person_run_length)
+        self.last_update_debug["raw_person_detections"] = raw_count
+        self.last_update_debug["person_detections"] = filtered_count
+
     def _reacquire_person(self, detection: Detection, now: float, used_tracks: set[int]) -> int | None:
         """Return one unambiguous, recently-lost confirmed person candidate.
 
@@ -242,6 +271,14 @@ class LightweightTracker:
 
     def update(self, detections: Iterable[Detection], now: float) -> list[Track]:
         detections = list(detections)
+        raw_person_count = sum(item.label == "person" for item in detections)
+        detections = self._filter_duplicate_person_detections(detections)
+        person_count = sum(item.label == "person" for item in detections)
+        before = len(self.tracks)
+        created_before, expired_before, reacquired_before = self.created_count, self.expired_count, self.reacquired_count
+        self.last_update_debug = {"tracks_before": before, "raw_person_detections": raw_person_count,
+                                  "person_detections": person_count}
+        self._record_person_cycle(raw_person_count, person_count)
         for track in self.tracks:
             track.was_lost = not track.seen_this_update
             track.seen_this_update = False
@@ -256,15 +293,19 @@ class LightweightTracker:
         for _, track_index, detection_index in sorted(pairs):
             if track_index in used_tracks or detection_index in used_detections:
                 continue
+            was_lost = self.tracks[track_index].was_lost
             self._update_track(self.tracks[track_index], detections[detection_index], now)
             used_tracks.add(track_index)
             used_detections.add(detection_index)
+            if was_lost and self.tracks[track_index].label == "person":
+                self.reacquired_count += 1
         for index, detection in enumerate(detections):
             if index not in used_detections:
                 reacquire_index = self._reacquire_person(detection, now, used_tracks)
                 if reacquire_index is not None:
                     self._update_track(self.tracks[reacquire_index], detection, now)
                     used_tracks.add(reacquire_index)
+                    used_detections.add(index)
                     self.reacquired_count += 1
                 elif not self._is_duplicate_person(detection):
                     self.tracks.append(self._new_track(detection, now))
@@ -276,7 +317,26 @@ class LightweightTracker:
             else:
                 surviving.append(track)
         self.tracks = surviving
+        self.last_update_debug.update({
+            "matched": len(used_tracks) - (self.reacquired_count - reacquired_before),
+            "reacquired": self.reacquired_count - reacquired_before,
+            "new": self.created_count - created_before,
+            "expired": self.expired_count - expired_before,
+            "unmatched_detections": len(detections) - len(used_detections),
+            "unmatched_tracks": max(0, before - len(used_tracks)),
+            "tracks_after": len(self.tracks),
+        })
         return list(self.tracks)
+
+    def continuity_summary(self) -> dict:
+        cycles = max(1, self.person_cycles)
+        return {"cycles": self.person_cycles, "zero": self.person_cycle_counts["zero"],
+                "one": self.person_cycle_counts["one"], "two_plus": self.person_cycle_counts["two_plus"],
+                "zero_percent": 100.0*self.person_cycle_counts["zero"]/cycles,
+                "one_percent": 100.0*self.person_cycle_counts["one"]/cycles,
+                "two_plus_percent": 100.0*self.person_cycle_counts["two_plus"]/cycles,
+                "longest_zero": self.person_longest_runs["zero"], "longest_one": self.person_longest_runs["one"],
+                "longest_two_plus": self.person_longest_runs["two_plus"], "duplicates": self.duplicate_person_detections}
 
     def visible_motion(self, track: Track) -> str:
         return track.motion if track.seen_this_update else LOST

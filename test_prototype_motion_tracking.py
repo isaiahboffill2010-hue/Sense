@@ -182,6 +182,35 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0].track_id, 1)
 
+    def test_initial_overlapping_person_detections_are_filtered(self):
+        tracker = self.tracker()
+        tracks = tracker.update([detection(x=100), detection(x=102)], 0)
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracker.duplicate_person_detections, 1)
+
+    def test_two_stationary_people_survive_jitter_and_short_misses(self):
+        tracker = self.tracker()
+        for index in range(120):
+            now = index * .4
+            detections = []
+            if index not in {20, 21, 75}:
+                detections.append(detection(x=100 + (index % 3) - 1, position="LEFT"))
+            if index not in {48, 49}:
+                detections.append(detection(x=350 + (index % 3) - 1, position="RIGHT"))
+            tracker.update(detections, now)
+        self.assertEqual(tracker.created_count, 2)
+        self.assertEqual(tracker.expired_count, 0)
+        self.assertEqual({track.track_id for track in tracker.tracks}, {1, 2})
+        self.assertGreaterEqual(tracker.reacquired_count, 2)
+
+    def test_continuity_counters_record_real_empty_detection_cycle(self):
+        tracker = self.tracker()
+        tracker.update([], 0)
+        tracker.update([detection()], .4)
+        tracker.update([detection(), detection(x=350)], .8)
+        report = tracker.continuity_summary()
+        self.assertEqual((report["zero"], report["one"], report["two_plus"]), (1, 1, 1))
+
     def test_high_priority_confirmation_is_two_quick_hits(self):
         tracker = self.tracker()
         first = tracker.update([detection()], 0)[0]
