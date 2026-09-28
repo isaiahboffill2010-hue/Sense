@@ -65,7 +65,7 @@ def group_motion(items,camera):
 def format_top(items):return [f"{x.track.display_id} | {x.level} | {x.transition} | {x.approach}" for x in items[:3]]
 def console(items,camera):return f"PEOPLE: {len(items)} tracked | TOP: "+("; ".join(format_top(items)) if items else "none")+(" | MOTION: UNCERTAIN" if camera.state==CAMERA_UNCERTAIN else "")
 def parse_args(argv:Sequence[str]|None=None):
- p=argparse.ArgumentParser();p.add_argument("--model",type=Path,default=DEFAULT_MODEL);p.add_argument("--labels",type=Path,default=DEFAULT_LABELS);p.add_argument("--confidence",type=float,default=.5);p.add_argument("--max-detection-fps",type=float,default=5);p.add_argument("--threads",type=int,default=2);p.add_argument("--camera-width",type=int,default=640);p.add_argument("--camera-height",type=int,default=480);p.add_argument("--benchmark-seconds",type=float,default=0);p.add_argument("--no-preview",action="store_true");p.add_argument("--debug-people",action="store_true");p.add_argument("--event-manager",action="store_true");p.add_argument("--debug-events",action="store_true");a=p.parse_args(argv)
+ p=argparse.ArgumentParser();p.add_argument("--model",type=Path,default=DEFAULT_MODEL);p.add_argument("--labels",type=Path,default=DEFAULT_LABELS);p.add_argument("--confidence",type=float,default=.5);p.add_argument("--max-detection-fps",type=float,default=5);p.add_argument("--threads",type=int,default=2);p.add_argument("--camera-width",type=int,default=640);p.add_argument("--camera-height",type=int,default=480);p.add_argument("--benchmark-seconds",type=float,default=0);p.add_argument("--no-preview",action="store_true");p.add_argument("--debug-people",action="store_true");p.add_argument("--event-manager",action="store_true");p.add_argument("--debug-events",action="store_true");p.add_argument("--speech",action="store_true");p.add_argument("--speech-dry-run",action="store_true");p.add_argument("--debug-speech",action="store_true");a=p.parse_args(argv)
  if a.benchmark_seconds<0:p.error("invalid benchmark duration")
  return a
 def main(argv=None):
@@ -76,9 +76,23 @@ def main(argv=None):
   detector=LiteRTDetector(a.model,a.labels,a.threads)
  except Exception as e:print(f"PHASE 7.5 STARTUP FAILED: {type(e).__name__}: {e}",file=sys.stderr);return 2
  camera=reader=None;started=time.monotonic();last=next_log=0.;engine=PersonEngine();tracker=LightweightTracker();smoother=MotionSmoother();gate=NewestFrameGate();manager=None
- if a.event_manager:
+ speech=None
+ if a.event_manager or a.speech or a.speech_dry_run:
   from prototype_event_manager import EventManager
   manager=EventManager()
+  if a.speech or a.speech_dry_run:
+   from prototype_speech_manager import SpeechManager
+   player=None
+   if a.speech and not a.speech_dry_run:
+    try:
+     import config
+     from hardware.audio import GeminiSpeechPlayer,SpeechController,SpeechPlayer
+     from gemini_tts import GeminiTTSProvider
+     fallback=SpeechPlayer().open(verify_playback=False)
+     provider=GeminiTTSProvider(model=config.GEMINI_TTS_MODEL,voice=config.GEMINI_TTS_VOICE,style=config.GEMINI_TTS_STYLE,timeout_s=config.GEMINI_TTS_TIMEOUT_S,volume_boost=config.GEMINI_TTS_VOLUME_BOOST,peak_ceiling=config.GEMINI_TTS_PEAK_CEILING).open()
+     controller=SpeechController(GeminiSpeechPlayer(provider,fallback));controller.start();player=controller
+    except Exception as exc:print(f"SPEECH SETUP FAILED: {type(exc).__name__}: {exc}",flush=True)
+   speech=SpeechManager(player,dry_run=a.speech_dry_run)
  print("SENSE PHASE 7.5 PERSON PROTOTYPE | Gemini/cloud/audio/navigation: DISABLED",flush=True)
  try:
   camera=Camera(resolution=(a.camera_width,a.camera_height),pixel_format="RGB888").open();reader=CameraReader(camera);reader.start();estimator=SparseCameraMotionEstimator(detector.cv2,detector.np)
@@ -92,7 +106,9 @@ def main(argv=None):
    if manager is not None:
     from prototype_event_manager import person_events
     for action,event,reason in manager.process(person_events(items,now),now):
+     if speech is not None and speech.submit(action,event,now) and a.debug_speech:print(f'SPEECH QUEUED: "{speech.pending.text}"',flush=True)
      if action=="EMIT" or a.debug_events:print(f"{action} [{event.priority}] {event.entity_type} #{event.entity_id} {event.event_type} {event.zone}: {reason}",flush=True)
+   if speech is not None:speech.process(now)
    if now>=next_log and manager is None:
     print(console(items,motion),flush=True)
     if a.debug_people:
