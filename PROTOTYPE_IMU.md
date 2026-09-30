@@ -33,11 +33,11 @@ not show `0x36` on an accessible HAT bus. They show:
 - bus 11: `0x36` as `UU`, plus `0x50`
 
 Buses 0, 10, and 11 are described as channels of the camera/display I2C mux.
-`UU` means a kernel driver already owns `11-0036`; it does not identify the
-device as the SH3001. Because bus 11 is on that mux and kernel-owned, this
-prototype will not detach its driver or force access. The identities of
-`0x30` and `0x50` are also not proven, so the prototype never accesses or
-writes either address.
+The Raspberry Pi probe has now identified kernel device `10-0036` as the
+**OV5647 camera**, owned by driver `ov5647`. It is not the IMU. The prototype
+will not detach its driver or force access. The identities of `0x30` and
+`0x50` are also not proven, so the prototype never accesses or writes either
+address.
 
 The physical RGB board is consistent with SunFounder's separate **11-channel
 Light Board**. Official PiDog source controls it with
@@ -57,20 +57,30 @@ cd ~/blind-navigation-headband
 python3 prototype_imu.py --probe
 ```
 
-The probe reports Python/package locations, `/dev/i2c-*`, and every device
-already represented in `/sys/bus/i2c/devices`, including the bound driver. It
-does not open an I2C device or write a register. Save its output, then run:
+The expanded probe reports:
+
+- Python/package locations;
+- whether the installed `robot_hat` exports or contains SH3001/RGB support;
+- every `/dev/i2c-*` controller and its device-tree route;
+- devices already represented in `/sys/bus/i2c/devices` and bound drivers;
+- the current GPIO2/GPIO3 pin function;
+- active I2C-related boot configuration lines;
+- Raspberry Pi HAT EEPROM product metadata.
+
+It does not open an I2C device, probe an address, or read/write a device
+register. Save its output, then run the short follow-up commands only if a
+field is unavailable:
 
 ```bash
-python3 -c "import robot_hat; print(robot_hat.__version__, robot_hat.__file__)"
-python3 -c "import pidog; print(pidog.__version__, pidog.__file__)"
-i2cdetect -l
-for d in /sys/bus/i2c/devices/*-*; do \
-  printf '%s  ' "$(basename "$d")"; \
-  cat "$d/name" 2>/dev/null || true; \
-  readlink -f "$d/driver" 2>/dev/null || true; \
-done
+readlink -f /sys/class/i2c-dev/i2c-*/device/of_node
+pinctrl get 2-3
+grep -nEi 'i2c|camera_auto_detect|display_auto_detect' /boot/firmware/config.txt
 ```
+
+The first maps Linux bus numbers to physical controllers. The second shows
+whether header pins GPIO2/GPIO3 are currently assigned to SDA1/SCL1. The last
+shows boot settings that can explain why the header controller is absent. All
+three commands are read-only.
 
 `i2cdetect` actively probes a bus and can be unsafe for unknown hardware, so
 do not repeat broad scans merely to run this prototype. If another scan is
@@ -80,35 +90,39 @@ actual Robot HAT I2C bus. The required result before `--leds` is `0x74` on that
 same bus. Do not use the `UU` address on bus 11 without first identifying its
 kernel driver.
 
-If `pidog` is absent, install SunFounder's official package rather than a
-generic MPU/ICM/BMI library:
-
-```bash
-cd ~
-git clone --depth=1 https://github.com/sunfounder/pidog.git
-sudo pip3 install ~/pidog --break-system-packages
-```
-
-This does not instantiate the full `Pidog` robot. The prototype imports only
-the official `Sh3001` and optional `RGBStrip` drivers. The already-installed
-`robot_hat` 2.5.7 remains the I2C transport.
+Do not install `pidog` merely because it is absent. SunFounder's official
+PiDog repository is currently the source of the matching `sh3001.py` and
+`rgb_strip.py` implementations, but those files are separable drivers rather
+than capabilities supplied by `robot_hat`. `sh3001.py` depends only on
+`robot_hat.I2C`, `robot_hat.fileDB`, and the Python standard library. The RGB
+driver depends on `smbus`, NumPy, and the standard library. Once the hardware
+is positively located, the preferred next implementation step is to reuse a
+pinned, attributed copy or a small project-local adaptation of only the
+needed official driver—not to install the full robot-control package. That
+decision also needs to retain the upstream GPLv2 licensing terms.
 
 ## Guarded startup and bus selection
 
-SunFounder's current `Sh3001` constructor hard-codes bus 1, which is not
-present on the described Pi. The adapter initializes `robot_hat.I2C` with the
-explicit `--bus` number but continues to use SunFounder's SH3001 register and
-sample implementation. Before the official initialization can write
-anything, it reads register `0x0f` at address `0x36` and requires chip ID
-`0x61`. A missing device, busy address, or different ID aborts with
-`IMU FAILED` and no initialization writes.
+SunFounder's Robot HAT V5 documentation says both external I2C connectors are
+directly wired to Raspberry Pi GPIO2/SDA and GPIO3/SCL. They are the same
+electrical bus; neither is routed through the HAT MCU. On a normal Pi 3 device
+tree this controller is exposed as `/dev/i2c-1`. Therefore the missing
+`/dev/i2c-1` must be explained before treating bus 2 as a substitute. Bus 2
+may be a display/HDMI controller and its address scan is not proof of HAT-port
+routing.
 
-After the Pi probe establishes the correct bus, run (replace `2` only with
-the bus actually containing a verified `0x36`):
+SunFounder's current `Sh3001` constructor hard-codes bus 1. The existing
+adapter can select another bus and has a chip-ID guard, but live initialization
+must not be attempted until the expanded probe proves which Linux controller
+maps to GPIO2/GPIO3 and the module is visible there.
+
+Only after the Pi probe establishes the correct header bus and a later,
+deliberately scoped read-only identity check confirms SH3001 ID `0x61` should
+the live prototype be run:
 
 ```bash
 cd ~/blind-navigation-headband
-ROBOT_HAT_GPIOCHIP=0 python3 prototype_imu.py --bus 2 --debug
+ROBOT_HAT_GPIOCHIP=0 python3 prototype_imu.py --bus CONFIRMED_BUS --debug
 ```
 
 `ROBOT_HAT_GPIOCHIP=0` is retained for consistency with this Robot HAT setup,
@@ -116,9 +130,8 @@ although the IMU itself is I2C and does not use GPIO. No camera or other Sense
 hardware is required. Stop with Ctrl+C. A finite bench run is available with
 `--duration 30`.
 
-Do **not** run that exact bus-2 command until `0x36` is actually present on
-bus 2. With the scans currently supplied, the expected result is a clean
-failure stating that the SH3001 candidate cannot be read.
+Do **not** run live initialization yet. In particular, do not point it at bus
+2 or either unknown address from the earlier scans.
 
 ## Calibration and units
 
@@ -247,8 +260,9 @@ is part of this commit.
   from an unclaimed `0x36` on the HAT bus.
 - The supplied scan conflicts with the official address evidence; `0x30` and
   `0x50` remain deliberately unidentified and untouched.
-- The kernel owner/name of bus-11 address `0x36` must be captured from sysfs;
-  the prototype will not detach it.
+- The mux-owned `0x36` is confirmed as the OV5647 camera and is excluded.
+- The missing GPIO2/GPIO3 header bus must be explained from device-tree,
+  pin-function, and boot-configuration evidence before any sensor access.
 - The RGB board is not verified until `0x74` appears. LED ordering needs a
   physical visual check.
 - Axis/sign mapping needs the four-motion wearing test described above.

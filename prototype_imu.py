@@ -17,7 +17,10 @@ import enum
 import math
 import os
 import platform
+import pkgutil
+import shutil
 import statistics
+import subprocess
 import sys
 import time
 from collections.abc import Iterable, Sequence
@@ -271,9 +274,9 @@ class SunFounderSh3001:
             from robot_hat import I2C
         except ImportError as exc:
             raise ImuError(
-                "SunFounder's PiDog IMU driver is unavailable. Install the official "
-                "sunfounder/pidog package; robot_hat alone does not contain Sh3001 "
-                f"({exc})."
+                "SunFounder's SH3001 driver is unavailable. Do not install or "
+                "initialize another package until --probe has positively located "
+                f"the hardware ({exc})."
             ) from exc
         imu = None
         try:
@@ -441,20 +444,99 @@ def collect_calibration(device: ImuDevice, seconds: float, rate_hz: float) -> Ca
     return calibrate_samples(samples, minimum=max(10, int(seconds * rate_hz * 0.5)))
 
 
+def _read_probe_text(path: str) -> str | None:
+    """Read a small procfs/sysfs/config value without changing system state."""
+    try:
+        with open(path, "rb") as source:
+            return source.read(16_384).replace(b"\x00", b"").decode(
+                "utf-8", errors="replace"
+            ).strip()
+    except OSError:
+        return None
+
+
+def _device_tree_path(path: str) -> str:
+    resolved = os.path.realpath(path)
+    marker = os.path.join("firmware", "devicetree", "base")
+    if marker in resolved:
+        return resolved.split(marker, 1)[1].replace(os.sep, "/") or "/"
+    return resolved
+
+
+def _robot_hat_sensor_evidence(module: object) -> tuple[list[str], list[str]]:
+    """Inspect installed Python source names/text; never import submodules."""
+    package_paths = list(getattr(module, "__path__", []))
+    module_names = sorted(item.name for item in pkgutil.iter_modules(package_paths))
+    source_hits: list[str] = []
+    needles = ("sh3001", "class imu", "rgbstrip", "rgb_strip", "0x74")
+    for package_path in package_paths:
+        try:
+            filenames = sorted(os.listdir(package_path))
+        except OSError:
+            continue
+        for filename in filenames:
+            if not filename.endswith(".py"):
+                continue
+            path = os.path.join(package_path, filename)
+            text = _read_probe_text(path)
+            if text is None:
+                continue
+            lowered = text.lower()
+            matches = sorted(needle for needle in needles if needle in lowered)
+            if matches:
+                source_hits.append(f"{filename}: {', '.join(matches)}")
+    return module_names, source_hits
+
+
 def probe_environment() -> int:
     print(f"Platform: {platform.platform()}")
     print(f"Python: {sys.version.split()[0]} ({sys.executable})")
+    robot_hat_module = None
     for module_name in ("robot_hat", "pidog"):
         try:
             module = __import__(module_name)
             print(f"{module_name}: version={getattr(module, '__version__', 'unknown')} file={module.__file__}")
+            if module_name == "robot_hat":
+                robot_hat_module = module
         except ImportError as exc:
             print(f"{module_name}: NOT INSTALLED ({exc})")
+    if robot_hat_module is not None:
+        module_names, source_hits = _robot_hat_sensor_evidence(robot_hat_module)
+        candidates = [
+            name for name in module_names
+            if any(token in name.lower() for token in ("imu", "sh3001", "rgb", "strip"))
+        ]
+        print(
+            "robot_hat sensor-named modules: "
+            + (", ".join(candidates) if candidates else "none")
+        )
+        print(
+            "robot_hat exports Sh3001/RGBStrip: {}/{}".format(
+                hasattr(robot_hat_module, "Sh3001"),
+                hasattr(robot_hat_module, "RGBStrip"),
+            )
+        )
+        print("robot_hat source evidence for SH3001/RGB board:")
+        if source_hits:
+            for hit in source_hits:
+                print(f"  {hit}")
+        else:
+            print("  none")
+
     dev = "/dev"
     buses = []
     if os.path.isdir(dev):
         buses = sorted(name for name in os.listdir(dev) if name.startswith("i2c-"))
     print("I2C device nodes: " + (", ".join(buses) if buses else "none"))
+    if buses:
+        print("I2C controller routes (device-tree paths):")
+        for bus_name in buses:
+            class_path = os.path.join("/sys/class/i2c-dev", bus_name, "device")
+            of_node = os.path.join(class_path, "of_node")
+            controller_name = _read_probe_text(os.path.join(class_path, "name"))
+            route = _device_tree_path(of_node) if os.path.exists(of_node) else "no of_node"
+            print(f"  {bus_name}: {controller_name or 'unknown'} -> {route}")
+
     sysfs = "/sys/bus/i2c/devices"
     if os.path.isdir(sysfs):
         print("Kernel I2C devices:")
@@ -470,8 +552,57 @@ def probe_environment() -> int:
             driver_path = os.path.join(sysfs, name, "driver")
             driver = os.path.basename(os.path.realpath(driver_path)) if os.path.exists(driver_path) else "unbound"
             print(f"  {name}: {device_name} (driver={driver})")
+
+    print("GPIO2/GPIO3 function (the Robot HAT external I2C wires):")
+    pinctrl = shutil.which("pinctrl")
+    raspi_gpio = shutil.which("raspi-gpio")
+    command = [pinctrl, "get", "2-3"] if pinctrl else (
+        [raspi_gpio, "get", "2-3"] if raspi_gpio else None
+    )
+    if command:
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=5, check=False
+            )
+            output = (result.stdout or result.stderr).strip()
+            print("  " + (output.replace("\n", "\n  ") if output else "no output"))
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"  unavailable ({type(exc).__name__}: {exc})")
+    else:
+        print("  pinctrl/raspi-gpio command not installed")
+
+    print("Boot configuration lines relevant to I2C routing:")
+    config_found = False
+    for config_path in ("/boot/firmware/config.txt", "/boot/config.txt"):
+        config_text = _read_probe_text(config_path)
+        if config_text is None:
+            continue
+        config_found = True
+        print(f"  [{config_path}]")
+        relevant = [
+            f"{line_number}: {line.strip()}"
+            for line_number, line in enumerate(config_text.splitlines(), 1)
+            if any(token in line.lower() for token in ("i2c", "camera_auto_detect", "display_auto_detect"))
+        ]
+        if relevant:
+            for line in relevant:
+                print(f"    {line}")
+        else:
+            print("    no matching lines")
+    if not config_found:
+        print("  no readable config.txt found")
+
+    print("Raspberry Pi HAT EEPROM identity:")
+    hat_found = False
+    for field in ("product", "product_id", "product_ver", "vendor", "uuid"):
+        value = _read_probe_text(os.path.join("/proc/device-tree/hat", field))
+        if value is not None:
+            hat_found = True
+            print(f"  {field}: {value}")
+    if not hat_found:
+        print("  no /proc/device-tree/hat metadata")
     print("Expected only (not proof of connection): SH3001=0x36, RGB board=0x74")
-    print("No registers were written by this probe.")
+    print("No I2C address was probed and no register was read or written by this probe.")
     return 0
 
 
