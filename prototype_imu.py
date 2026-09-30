@@ -463,6 +463,30 @@ def _device_tree_path(path: str) -> str:
     return resolved
 
 
+def _live_device_tree_value(relative_node: str, property_name: str) -> str | None:
+    relative_node = relative_node.lstrip("/")
+    return _read_probe_text(os.path.join("/proc/device-tree", relative_node, property_name))
+
+
+def _run_probe_command(command: list[str]) -> str | None:
+    """Run an explicitly read-only diagnostic command when it is installed."""
+    executable = shutil.which(command[0])
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, *command[1:]],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    return output or f"no output (exit {result.returncode})"
+
+
 def _robot_hat_sensor_evidence(module: object) -> tuple[list[str], list[str]]:
     """Inspect installed Python source names/text; never import submodules."""
     package_paths = list(getattr(module, "__path__", []))
@@ -537,6 +561,31 @@ def probe_environment() -> int:
             route = _device_tree_path(of_node) if os.path.exists(of_node) else "no of_node"
             print(f"  {bus_name}: {controller_name or 'unknown'} -> {route}")
 
+    print("Live device-tree i2c1/i2c_arm state:")
+    symbols_root = "/proc/device-tree/__symbols__"
+    symbol_found = False
+    for symbol in ("i2c_arm", "i2c1"):
+        node_path = _read_probe_text(os.path.join(symbols_root, symbol))
+        if node_path is None:
+            continue
+        symbol_found = True
+        status = _live_device_tree_value(node_path, "status") or "okay (no status property)"
+        compatible = _live_device_tree_value(node_path, "compatible") or "unknown"
+        pinctrl_names = _live_device_tree_value(node_path, "pinctrl-names") or "none"
+        print(
+            f"  {symbol} -> {node_path}: status={status}; "
+            f"compatible={compatible}; pinctrl-names={pinctrl_names}"
+        )
+    if not symbol_found:
+        print("  i2c_arm/i2c1 symbols not present")
+
+    print("Loaded I2C kernel support:")
+    for module_name in ("i2c_bcm2835", "i2c_dev"):
+        print(
+            f"  {module_name}: "
+            + ("loaded" if os.path.isdir(os.path.join("/sys/module", module_name)) else "not loaded")
+        )
+
     sysfs = "/sys/bus/i2c/devices"
     if os.path.isdir(sysfs):
         print("Kernel I2C devices:")
@@ -571,7 +620,7 @@ def probe_environment() -> int:
     else:
         print("  pinctrl/raspi-gpio command not installed")
 
-    print("Boot configuration lines relevant to I2C routing:")
+    print("Boot configuration (non-comment lines, preserving section/order):")
     config_found = False
     for config_path in ("/boot/firmware/config.txt", "/boot/config.txt"):
         config_text = _read_probe_text(config_path)
@@ -582,7 +631,7 @@ def probe_environment() -> int:
         relevant = [
             f"{line_number}: {line.strip()}"
             for line_number, line in enumerate(config_text.splitlines(), 1)
-            if any(token in line.lower() for token in ("i2c", "camera_auto_detect", "display_auto_detect"))
+            if line.strip() and not line.lstrip().startswith("#")
         ]
         if relevant:
             for line in relevant:
@@ -591,6 +640,28 @@ def probe_environment() -> int:
             print("    no matching lines")
     if not config_found:
         print("  no readable config.txt found")
+
+    print("Robot HAT 5 boot overlay availability:")
+    overlay_names = ("sunfounder-robothat5.dtbo", "sunfounder_robothat5.dtbo")
+    overlay_found = False
+    for overlays_dir in ("/boot/firmware/overlays", "/boot/overlays"):
+        for overlay_name in overlay_names:
+            overlay_path = os.path.join(overlays_dir, overlay_name)
+            if os.path.isfile(overlay_path):
+                overlay_found = True
+                print(f"  present: {overlay_path} ({os.path.getsize(overlay_path)} bytes)")
+    if not overlay_found:
+        print("  missing (checked hyphen and underscore filenames)")
+
+    print("Overlay/configuration diagnostics:")
+    for label, command in (
+        ("dtoverlay -l", ["dtoverlay", "-l"]),
+        ("vcgencmd get_config str", ["vcgencmd", "get_config", "str"]),
+        ("vcgencmd get_config int", ["vcgencmd", "get_config", "int"]),
+    ):
+        output = _run_probe_command(command)
+        print(f"  [{label}]")
+        print("    " + ((output or "command unavailable").replace("\n", "\n    ")))
 
     print("Raspberry Pi HAT EEPROM identity:")
     hat_found = False
